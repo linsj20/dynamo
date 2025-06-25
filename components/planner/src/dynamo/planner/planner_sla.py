@@ -59,6 +59,12 @@ class Planner:
         self.namespace = dynamo_context["namespace"]
         config_instance = config.get("Planner", {})
 
+        # Get SLO level first to determine tensor parallelism settings
+        slo_level = config_instance.get("slo-level", SLAPlannerDefaults.slo_level)
+        
+        # Apply SLO-aware tensor parallelism configuration
+        tp_config = self._get_slo_tensor_parallelism_config(slo_level)
+        
         self.args = argparse.Namespace(
             namespace=self.namespace,
             environment=config_instance.get(
@@ -77,11 +83,12 @@ class Planner:
             min_endpoint=config_instance.get(
                 "min-endpoint", SLAPlannerDefaults.min_endpoint
             ),
+            # Apply SLO-aware tensor parallelism for decode/prefill engines
             decode_engine_num_gpu=config_instance.get(
-                "decode-engine-num-gpu", SLAPlannerDefaults.decode_engine_num_gpu
+                "decode-engine-num-gpu", tp_config["decode_tp"]
             ),
             prefill_engine_num_gpu=config_instance.get(
-                "prefill-engine-num-gpu", SLAPlannerDefaults.prefill_engine_num_gpu
+                "prefill-engine-num-gpu", tp_config["prefill_tp"]
             ),
             prometheus_endpoint=config_instance.get(
                 "prometheus-endpoint", SLAPlannerDefaults.prometheus_endpoint
@@ -100,7 +107,84 @@ class Planner:
                 "load-prediction-window-size",
                 SLAPlannerDefaults.load_prediction_window_size,
             ),
+            
+            # SLO-specific configuration
+            slo_level=slo_level,
+            slo_priority=config_instance.get("slo-priority", SLAPlannerDefaults.slo_priority),
+            slo_description=config_instance.get("slo-description", SLAPlannerDefaults.slo_description),
+            
+            # SLO-aware scaling behavior
+            enable_proactive_scaling=config_instance.get(
+                "enable-proactive-scaling", SLAPlannerDefaults.enable_proactive_scaling
+            ),
+            enable_burst_protection=config_instance.get(
+                "enable-burst-protection", SLAPlannerDefaults.enable_burst_protection
+            ),
+            slo_violation_threshold=config_instance.get(
+                "slo-violation-threshold", SLAPlannerDefaults.slo_violation_threshold
+            ),
+            scale_up_aggressiveness=config_instance.get(
+                "scale-up-aggressiveness", SLAPlannerDefaults.scale_up_aggressiveness
+            ),
+            
+            # Performance monitoring
+            performance_buffer_ratio=config_instance.get(
+                "performance-buffer-ratio", SLAPlannerDefaults.performance_buffer_ratio
+            ),
+            latency_percentile=config_instance.get(
+                "latency-percentile", SLAPlannerDefaults.latency_percentile
+            ),
+            cost_optimization_mode=config_instance.get(
+                "cost-optimization-mode", SLAPlannerDefaults.cost_optimization_mode
+            ),
+            
+            # Scaling thresholds
+            prefill_queue_scale_up_threshold=config_instance.get(
+                "prefill-queue-scale-up-threshold", SLAPlannerDefaults.prefill_queue_scale_up_threshold
+            ),
+            prefill_queue_scale_down_threshold=config_instance.get(
+                "prefill-queue-scale-down-threshold", SLAPlannerDefaults.prefill_queue_scale_down_threshold
+            ),
+            decode_kv_scale_up_threshold=config_instance.get(
+                "decode-kv-scale-up-threshold", SLAPlannerDefaults.decode_kv_scale_up_threshold
+            ),
+            decode_kv_scale_down_threshold=config_instance.get(
+                "decode-kv-scale-down-threshold", SLAPlannerDefaults.decode_kv_scale_down_threshold
+            ),
+            
+            # Tensor parallelism configuration
+            tensor_parallel_size_decode=tp_config["decode_tp"],
+            tensor_parallel_size_prefill=tp_config["prefill_tp"],
+            gpu_memory_utilization=tp_config["gpu_memory_util"],
         )
+        
+        # Log SLO-aware configuration at startup
+        logger.info(f"SLA Planner initialized with SLO configuration:")
+        logger.info(f"  SLO Level: {self.args.slo_level} (Priority: {self.args.slo_priority})")
+        logger.info(f"  Description: {self.args.slo_description}")
+        logger.info(f"  SLO Targets: TTFT={self.args.ttft}s, ITL={self.args.itl}s")
+        logger.info(f"  Expected workload: ISL={self.args.isl}, OSL={self.args.osl}")
+        logger.info(f"  Tensor Parallelism: Decode TP={self.args.decode_engine_num_gpu}, Prefill TP={self.args.prefill_engine_num_gpu}")
+        logger.info(f"  GPU Memory Utilization: {self.args.gpu_memory_utilization}")
+        logger.info(f"  Scaling behavior: {self.args.scale_up_aggressiveness} aggressiveness")
+        logger.info(f"  Proactive scaling: {self.args.enable_proactive_scaling}")
+        logger.info(f"  Burst protection: {self.args.enable_burst_protection}")
+        logger.info(f"  SLO violation threshold: {self.args.slo_violation_threshold*100}%")
+        logger.info(f"  Performance buffer: {self.args.performance_buffer_ratio*100}%")
+        logger.info(f"  Cost optimization mode: {self.args.cost_optimization_mode}")
+        logger.info(f"  TP Configuration: {tp_config['description']}")
+
+    def _get_slo_tensor_parallelism_config(self, slo_level: str) -> dict:
+        """Get tensor parallelism configuration based on SLO level"""
+        tp_map = SLAPlannerDefaults.slo_tensor_parallelism_map
+        
+        if slo_level.upper() in tp_map:
+            config = tp_map[slo_level.upper()]
+            logger.info(f"Applying SLO-aware tensor parallelism for {slo_level} SLO: {config['description']}")
+            return config
+        else:
+            logger.warning(f"Unknown SLO level '{slo_level}', using MEDIUM defaults")
+            return tp_map["MEDIUM"]
 
     @async_on_start
     async def async_init(self):

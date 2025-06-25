@@ -31,7 +31,8 @@ from dynamo.sdk.lib.image import DYNAMO_IMAGE
 logger = logging.getLogger(__name__)
 
 # TODO: temp workaround to avoid port conflict with subprocess HTTP server; remove this once ingress is fixed
-os.environ["DYNAMO_PORT"] = "3999"
+# TEMPORARILY DISABLED for Global Scheduler testing - let YAML configs control ports
+# os.environ["DYNAMO_PORT"] = "3999"
 
 
 def get_http_binary_path():
