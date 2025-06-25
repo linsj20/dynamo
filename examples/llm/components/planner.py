@@ -381,24 +381,32 @@ class Planner:
 # TODO: let's make it such that planner still works via CLI invokation
 async def start_planner(runtime: DistributedRuntime, args: argparse.Namespace):
     planner = Planner(runtime, args)
-    console = Console()
-    table = Table()
-    table.add_column("Component", style="cyan")
-    table.add_column("Endpoint", style="green")
-
-    components = await runtime.etcd_client().kv_get_prefix(args.namespace)
-    for component in components:
-        try:
-            data = json.loads(component["value"].decode("utf-8"))
-            if "component" in data:
-                name = data["component"]
-                endpoint = data["endpoint"]
-                table.add_row(name, endpoint)
-        except Exception:
-            # Some entries may not be valid JSON or might be binary data
-            pass
-
-    console.print(table)
+    
+    # Fixed: Search for components under the correct instances/ prefix
+    instances_prefix = f"instances/{args.namespace}"
+    components = await runtime.etcd_client().kv_get_prefix(instances_prefix)
+    
+    # Only show component table if there are actually components found (reduces noise)
+    if components:
+        console = Console()
+        table = Table()
+        table.add_column("Component", style="cyan")
+        table.add_column("Endpoint", style="green")
+        
+        for component in components:
+            try:
+                data = json.loads(component["value"].decode("utf-8"))
+                if "component" in data:
+                    name = data["component"]
+                    endpoint = data["endpoint"]
+                    table.add_row(name, endpoint)
+            except Exception:
+                # Some entries may not be valid JSON or might be binary data
+                pass
+        
+        console.print(table)
+    else:
+        logger.debug(f"No components found in namespace: {args.namespace}")
 
     await planner.run()
 

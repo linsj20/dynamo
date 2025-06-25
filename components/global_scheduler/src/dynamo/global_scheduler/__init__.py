@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from .scheduler import SimpleGlobalScheduler
+from .scheduler import GlobalScheduler
 
-__all__ = ["SimpleGlobalScheduler"] 
+__all__ = ["GlobalScheduler"] 
