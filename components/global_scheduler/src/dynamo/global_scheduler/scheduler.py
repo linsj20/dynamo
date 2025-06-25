@@ -11,17 +11,17 @@ try:
     # Check if target is already set
     try:
         target = get_target()
-        print(f"✅ Target already set: {target}")
+        print(f"PASS: Target already set: {target}")
     except (NameError, RuntimeError) as e:
-        print(f"⚠️  Target not set, setting up: {e}")
+        print(f"WARNING: Target not set, setting up: {e}")
         from dynamo.sdk.core.lib import set_target
         from dynamo.sdk.core.runner.dynamo import LocalDeploymentTarget
         
         target = LocalDeploymentTarget()
         set_target(target)
-        print(f"✅ Target set successfully: {target}")
+        print(f"PASS: Target set successfully: {target}")
 except Exception as e:
-    print(f"❌ Failed to set up target: {e}")
+    print(f"FAIL: Failed to set up target: {e}")
     # Continue anyway - maybe we're in a different context
 
 import asyncio
