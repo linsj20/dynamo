@@ -23,6 +23,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'components', 'glo
 
 from tests.test_base import BaseGlobalSchedulerTest
 from tests.test_simple import SimpleSchedulerTest
+from monitor import SystemMonitor
 
 # Configure logging
 logging.basicConfig(
@@ -38,13 +39,19 @@ logging.getLogger('requests').setLevel(logging.WARNING)
 class ServiceManager:
     """Manages the lifecycle of services needed for Global Scheduler testing"""
     
-    def __init__(self, config_dir: str = "configs"):
+    def __init__(self, config_dir: str = "configs", pd_disagg: bool = False):
         self.config_dir = config_dir
+        self.pd_disagg = pd_disagg
         self.processes: Dict[str, subprocess.Popen] = {}
         self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
         # Port counter for dynamic port allocation (multi-node safe)
         self.next_dynamo_port = 4000
+        
+        # GPU allocation for PD disaggregated mode
+        # High SLO pool: GPUs 0-3, Low SLO pool: GPUs 4-7
+        self.high_slo_gpus = [0, 1, 2, 3]
+        self.low_slo_gpus = [4, 5, 6, 7]
         
         # Setup paths
         self._setup_environment()
@@ -169,13 +176,22 @@ class ServiceManager:
         """Start the high and low SLO pools"""
         logger.info("Starting SLO pools...")
         
-        # Start high SLO pool
-        if not self._start_pool('high', 8000, '0'):
-            return False
-            
-        # Start low SLO pool  
-        if not self._start_pool('low', 8002, '1'):
-            return False
+        if self.pd_disagg:
+            # Start high SLO pool with PD disaggregated architecture
+            if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus):
+                return False
+                
+            # Start low SLO pool with PD disaggregated architecture  
+            if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus):
+                return False
+        else:
+            # Start high SLO pool with original single-GPU setup
+            if not self._start_pool('high', 8000, '0'):
+                return False
+                
+            # Start low SLO pool with original single-GPU setup
+            if not self._start_pool('low', 8002, '1'):
+                return False
             
         return True
     
@@ -249,6 +265,84 @@ class ServiceManager:
             logger.error(f"FAIL: Failed to start {slo_level} SLO pool: {e} - check {log_file}")
             return False
     
+    def _start_pd_disagg_pool(self, slo_level: str, port: int, gpu_list: list) -> bool:
+        """Start a specific SLO pool with PD disaggregated architecture"""
+        log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pd_disagg_pool.log')
+        
+        try:
+            config_file = os.path.join(self.config_dir, f'pd_disagg_{slo_level}_slo.yaml')
+            if not os.path.exists(config_file):
+                logger.error(f"FAIL: Config file not found: {config_file}")
+                return False
+            
+            # Make config file path absolute to work from any directory
+            config_file = os.path.abspath(config_file)
+            
+            # Get next available DYNAMO_PORT using counter
+            dynamo_port = self._get_next_dynamo_port()
+            
+            # Convert GPU list to CUDA_VISIBLE_DEVICES format
+            gpu_range = ','.join(str(gpu) for gpu in gpu_list)
+            
+            logger.info(f"  Starting {slo_level.upper()} SLO PD Disagg pool:")
+            logger.info(f"    - GPU range: {gpu_range} (planner will assign GPUs within this range)")
+            logger.info(f"    - HTTP port {port}, FastAPI port {dynamo_port}")
+            logger.info(f"    - Starts with 1P+1D workers, can scale via planner")
+            logger.info(f"    - Log: {log_file}")
+            
+            # Set environment for this pool with GPU range
+            env = os.environ.copy()
+            env.update({
+                'CUDA_VISIBLE_DEVICES': gpu_range,
+                'DYN_DISABLE_AUTO_GPU_ALLOCATION': '0',  # Enable auto allocation within range
+                'DYNAMO_PORT': str(dynamo_port),
+                'GLOBAL_SCHEDULER_HOST': 'localhost',
+                'GLOBAL_SCHEDULER_PORT': '3999',
+                'POOL_HOST': 'localhost'
+            })
+            
+            # Change to examples/llm directory
+            llm_dir = os.path.join(self.project_root, 'examples', 'llm')
+            
+            with open(log_file, 'w') as f:
+                process = subprocess.Popen([
+                    'dynamo', 'serve', 'graphs.disagg_router:Frontend',
+                    '-f', config_file,
+                    f'--Frontend.port={port}',
+                    f'--Frontend.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
+                    f'--Processor.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
+                    f'--Router.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
+                    f'--VllmWorker.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
+                    f'--PrefillWorker.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
+                    f'--Planner.ServiceArgs.dynamo.namespace={slo_level}_slo_pd'
+                ], stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
+                
+            self.processes[f'{slo_level}_pd_disagg_pool'] = process
+            
+            # Wait for startup (longer for disaggregated setup)
+            time.sleep(15)
+            
+            if process.poll() is None:
+                logger.info(f"    PASS: {slo_level.upper()} SLO PD Disagg pool is running (PID: {process.pid})")
+                return True
+            else:
+                logger.error(f"    FAIL: {slo_level.upper()} SLO PD Disagg pool failed to start - check {log_file}")
+                # Show the last few lines of the log for quick debugging
+                try:
+                    with open(log_file, 'r') as f:
+                        lines = f.readlines()
+                        if lines:
+                            logger.error(f"    Last few lines from {log_file}:")
+                            for line in lines[-5:]:
+                                logger.error(f"      {line.strip()}")
+                except:
+                    pass
+                return False
+                
+        except Exception as e:
+            logger.error(f"FAIL: Failed to start {slo_level} SLO PD Disagg pool: {e} - check {log_file}")
+            return False
+    
     def stop_all(self):
         """Stop all running services"""
         if not self.processes:
@@ -280,12 +374,15 @@ class TestRunner:
     """Main test runner that orchestrates the complete test lifecycle"""
     
     def __init__(self, test_type: str = "simple", deployment: str = "local", 
-                 config_dir: str = "configs", start_services: bool = True):
+                 config_dir: str = "configs", start_services: bool = True, monitor: bool = False, pd_disagg: bool = False):
         self.test_type = test_type
         self.deployment = deployment
         self.start_services = start_services
+        self.monitor = monitor
+        self.pd_disagg = pd_disagg
         self.config = self._get_deployment_config()
-        self.service_manager = ServiceManager(config_dir) if start_services else None
+        self.service_manager = ServiceManager(config_dir, pd_disagg) if start_services else None
+        self.system_monitor = None
         
     def _get_deployment_config(self) -> Dict[str, Any]:
         """Get configuration based on deployment mode"""
@@ -318,6 +415,11 @@ class TestRunner:
         logger.info(f"Test Type: {self.test_type}")
         logger.info(f"Deployment: {self.deployment}")
         logger.info(f"Start Services: {self.start_services}")
+        logger.info(f"Monitor: {self.monitor}")
+        logger.info(f"PD Disaggregated: {self.pd_disagg}")
+        if self.pd_disagg:
+            logger.info(f"GPU Allocation: High SLO (0-3), Low SLO (4-7)")
+            logger.info(f"Each pool starts with 2 GPUs (1P+1D), can scale to 4 GPUs")
         logger.info("=" * 60)
         
         try:
@@ -334,8 +436,22 @@ class TestRunner:
                     return False
                 
                 # Wait for services to be fully ready
-                logger.info("Waiting for services to initialize (60 seconds)...")
-                time.sleep(60)
+                if self.pd_disagg:
+                    logger.info("Waiting for services to initialize (90 seconds)...")
+                    time.sleep(90)
+                else:
+                    logger.info("Waiting for services to initialize (60 seconds)...")
+                    time.sleep(60)
+            # Start monitoring if requested
+            if self.monitor:
+                pool_urls = {
+                    'high_slo': self.config['high_slo_pool_url'],
+                    'low_slo': self.config['low_slo_pool_url']
+                }
+                logs_dir = self.service_manager.logs_dir if self.service_manager else os.path.join(os.path.dirname(__file__), 'logs')
+                
+                self.system_monitor = SystemMonitor(pool_urls, logs_dir)
+                await self.system_monitor.start()
             
             # Run the actual tests
             if self.test_type == "simple":
@@ -353,6 +469,10 @@ class TestRunner:
             traceback.print_exc()
             return False
         finally:
+            # Stop monitoring if it was started
+            if self.system_monitor:
+                await self.system_monitor.stop()
+            
             # Always cleanup services if we started them
             if self.start_services and self.service_manager:
                 self.service_manager.stop_all()
@@ -368,6 +488,10 @@ def main():
                        help="Directory containing configuration files (default: configs)")
     parser.add_argument("--no-start-services", action="store_true",
                        help="Skip starting services (assume they're already running)")
+    parser.add_argument("--monitor", action="store_true", default=False,
+                       help="Enable lightweight online monitoring of GPU utilization and pool load (default: false)")
+    parser.add_argument("--pd-disagg", action="store_true", default=False,
+                       help="Use PD disaggregated architecture with scaling support (GPUs 0-3 for high SLO, 4-7 for low SLO)")
     
     args = parser.parse_args()
     
@@ -384,7 +508,9 @@ def main():
         test_type=args.test_type, 
         deployment=args.deployment,
         config_dir=args.config_dir,
-        start_services=not args.no_start_services
+        start_services=not args.no_start_services,
+        monitor=args.monitor,
+        pd_disagg=args.pd_disagg
     )
     
     success = asyncio.run(runner.run_complete_test())

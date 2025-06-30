@@ -75,9 +75,7 @@ def parse_args(service_name, prefix) -> Namespace:
 
 
 @service(
-    dynamo={
-        "namespace": "dynamo",
-    },
+    dynamo={},  # Empty dynamo config allows dynamic namespace from command line
     resources={"cpu": "10", "memory": "20Gi"},
     workers=1,
 )
@@ -101,8 +99,12 @@ class Router:
     @async_on_start
     async def async_init(self):
         self.runtime = dynamo_context["runtime"]
+        
+        # Use dynamic namespace from dynamo_context instead of hardcoded "dynamo"
+        current_namespace = dynamo_context["namespace"]
+        
         self.workers_client = (
-            await self.runtime.namespace("dynamo")
+            await self.runtime.namespace(current_namespace)
             .component("VllmWorker")
             .endpoint("generate")
             .client()
@@ -112,7 +114,7 @@ class Router:
 
         await check_required_workers(self.workers_client, self.args.min_workers)
 
-        kv_listener = self.runtime.namespace("dynamo").component("VllmWorker")
+        kv_listener = self.runtime.namespace(current_namespace).component("VllmWorker")
         await kv_listener.create_service()
         if self.router_type == RouterType.KV:
             self.indexer = KvIndexer(kv_listener, self.args.block_size)

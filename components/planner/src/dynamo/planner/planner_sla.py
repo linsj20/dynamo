@@ -39,10 +39,7 @@ class RequestType(BaseModel):
 
 
 @service(
-    dynamo={
-        "namespace": "dynamo",
-        "component_type": ComponentType.PLANNER,
-    },
+    dynamo={},  # Empty dynamo config allows dynamic namespace from command line
     resources={"cpu": "10", "memory": "20Gi"},
     workers=1,
     image=DYNAMO_IMAGE,
