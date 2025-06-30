@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Simple Low SLO Configuration - Optimized for throughput
+Common:
+  model: Qwen/Qwen2.5-3B-Instruct
+  block-size: 64
+  max-model-len: 8192
+
+Frontend:
+  served_model_name: Qwen/Qwen2.5-3B-Instruct
+  endpoint: dynamo.Processor.chat/completions
+  port: 8002
+  router: round-robin
+  common-configs: [block-size]
+
+VllmWorker:
+  enforce-eager: true
+  max-num-batched-tokens: 8192
+  enable-prefix-caching: true
+  max-num-seqs: 64
+  ServiceArgs:
+    workers: 1
+    resources:
+      gpu: '1'
+  common-configs: [model, block-size, max-model-len] 

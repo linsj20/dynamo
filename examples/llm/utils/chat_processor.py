@@ -138,6 +138,13 @@ class ChatProcessor:
     async def preprocess(self, raw_request: ChatCompletionRequest) -> PreprocessResult:
         request = self.parse_raw_request(raw_request)
 
+        # If no chat template is provided and tokenizer doesn't have one,
+        # use a simple format that just concatenates messages
+        if not request.chat_template and not self.tokenizer.chat_template:
+            chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}User: {{ message['content'] }}\n{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}\n{% endif %}{% endfor %}Assistant:"
+        else:
+            chat_template = request.chat_template or self.tokenizer.chat_template
+
         (
             conversation,
             request_prompts,
@@ -146,7 +153,7 @@ class ChatProcessor:
             request,
             self.tokenizer,
             request.messages,
-            chat_template=request.chat_template or self.tokenizer.chat_template,
+            chat_template=chat_template,
             chat_template_content_format=self.openai_serving.chat_template_content_format,
             add_generation_prompt=request.add_generation_prompt,
             continue_final_message=request.continue_final_message,

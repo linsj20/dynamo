@@ -44,9 +44,7 @@ class RequestType(Enum):
 
 
 @service(
-    dynamo={
-        "namespace": "dynamo",
-    },
+    dynamo={},  # Empty dynamo config allows dynamic namespace from command line
     resources={"cpu": "10", "memory": "20Gi"},
     workers=1,
 )
@@ -94,9 +92,12 @@ class Processor(ProcessMixIn):
     @async_on_start
     async def async_init(self):
         runtime = dynamo_context["runtime"]
-        comp_ns, comp_name = VllmWorker.dynamo_address()  # type: ignore
+        
+        # Use dynamic namespace from dynamo_context instead of hardcoded namespace
+        current_namespace = dynamo_context["namespace"]
+        _, comp_name = VllmWorker.dynamo_address()  # Only get component name
         self.worker_client = (
-            await runtime.namespace(comp_ns)
+            await runtime.namespace(current_namespace)
             .component(comp_name)
             .endpoint("generate")
             .client()
@@ -104,9 +105,9 @@ class Processor(ProcessMixIn):
 
         self.use_router = self.engine_args.router in (RouterType.KV, RouterType.KV_LOAD)
         if self.use_router:
-            router_ns, router_name = Router.dynamo_address()  # type: ignore
+            _, router_name = Router.dynamo_address()  # Only get component name
             self.router_client = (
-                await runtime.namespace(router_ns)
+                await runtime.namespace(current_namespace)
                 .component(router_name)
                 .endpoint("generate")
                 .client()
@@ -114,13 +115,14 @@ class Processor(ProcessMixIn):
 
         await check_required_workers(self.worker_client, self.min_workers)
 
-        kv_listener = runtime.namespace("dynamo").component("VllmWorker")
+        # Use dynamic namespace for KV listener as well
+        kv_listener = runtime.namespace(current_namespace).component("VllmWorker")
         await kv_listener.create_service()
         self.metrics_aggregator = KvMetricsAggregator(kv_listener)
 
         self.etcd_kv_cache = await EtcdKvCache.create(
             runtime.etcd_client(),
-            f"/{comp_ns}/processor/",
+            f"/{current_namespace}/processor/",
             {"router": self.engine_args.router},
         )
 

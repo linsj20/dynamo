@@ -101,8 +101,21 @@ def create_dynamo_watcher(
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse DYNAMO_SERVICE_ENVS: {e}")
 
-    # use namespace from the service
-    namespace, _ = svc.dynamo_address()
+    # Get namespace from ServiceConfig (dynamic) if available, otherwise fallback to service definition
+    from dynamo.sdk.lib.config import ServiceConfig
+    config = ServiceConfig.get_instance()
+    
+    # Try to get dynamic namespace from ServiceConfig first
+    service_config = config.get(svc.name, {})
+    service_args = service_config.get("ServiceArgs", {})
+    dynamo_config = service_args.get("dynamo", {})
+    dynamic_namespace = dynamo_config.get("namespace")
+    
+    if dynamic_namespace:
+        namespace = dynamic_namespace
+    else:
+        # Fallback to hardcoded namespace from service definition
+        namespace, _ = svc.dynamo_address()
 
     # Create the watcher with updated environment
     watcher = create_circus_watcher(
@@ -212,11 +225,27 @@ def serve_dynamo_graph(
         if not service_name and not standalone:
             with contextlib.ExitStack() as port_stack:
                 # first check if all components has the same namespace
+                # Get namespace from ServiceConfig (dynamic) if available, otherwise fallback to service definition
+                from dynamo.sdk.lib.config import ServiceConfig
+                config = ServiceConfig.get_instance()
+                
                 namespaces = set()
                 for name, dep_svc in svc.all_services().items():
                     if name == svc.name or name in dependency_map:
                         continue
-                    namespaces.add(dep_svc.dynamo_address()[0])
+                    
+                    # Try to get dynamic namespace from ServiceConfig first
+                    service_config = config.get(name, {})
+                    service_args = service_config.get("ServiceArgs", {})
+                    dynamo_config = service_args.get("dynamo", {})
+                    dynamic_namespace = dynamo_config.get("namespace")
+                    
+                    if dynamic_namespace:
+                        namespaces.add(dynamic_namespace)
+                    else:
+                        # Fallback to hardcoded namespace from service definition
+                        namespaces.add(dep_svc.dynamo_address()[0])
+                
                 if len(namespaces) > 1:
                     raise RuntimeError(
                         f"All components must have the same namespace, got {namespaces}"
@@ -250,7 +279,21 @@ def serve_dynamo_graph(
                 # reserve one more to avoid conflicts
                 port_stack.enter_context(reserve_free_port())
         else:
-            namespace, _ = svc.dynamo_address()
+            # Get namespace from ServiceConfig (dynamic) if available, otherwise fallback to service definition
+            from dynamo.sdk.lib.config import ServiceConfig
+            config = ServiceConfig.get_instance()
+            
+            # Try to get dynamic namespace from ServiceConfig first
+            service_config = config.get(svc.name, {})
+            service_args = service_config.get("ServiceArgs", {})
+            dynamo_config = service_args.get("dynamo", {})
+            dynamic_namespace = dynamo_config.get("namespace")
+            
+            if dynamic_namespace:
+                namespace = dynamic_namespace
+            else:
+                # Fallback to hardcoded namespace from service definition
+                namespace, _ = svc.dynamo_address()
         dynamo_args = [
             "-m",
             _DYNAMO_WORKER_SCRIPT,

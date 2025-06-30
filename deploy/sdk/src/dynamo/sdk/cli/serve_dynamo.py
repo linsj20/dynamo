@@ -142,7 +142,22 @@ def main(
         service = service.find_dependent_by_name(service_name)
 
     # Set namespace in dynamo_context if service is a dynamo component
-    namespace, _ = service.dynamo_address()
+    # Get namespace from ServiceConfig (dynamic) if available, otherwise fallback to service definition
+    from dynamo.sdk.lib.config import ServiceConfig
+    config = ServiceConfig.get_instance()
+    
+    # Try to get dynamic namespace from ServiceConfig first
+    service_config = config.get(service.name, {})
+    service_args = service_config.get("ServiceArgs", {})
+    dynamo_config = service_args.get("dynamo", {})
+    dynamic_namespace = dynamo_config.get("namespace")
+    
+    if dynamic_namespace:
+        namespace = dynamic_namespace
+    else:
+        # Fallback to hardcoded namespace from service definition
+        namespace, _ = service.dynamo_address()
+    
     dynamo_context["namespace"] = namespace
 
     configure_dynamo_logging(service_name=service_name, worker_id=worker_id)
@@ -159,7 +174,9 @@ def main(
         global dynamo_context
         dynamo_context["runtime"] = runtime
         # Get Dynamo configuration and create component
-        namespace, component_name = service.dynamo_address()
+        # Use the namespace that was already determined and set in dynamo_context
+        namespace = dynamo_context["namespace"]
+        _, component_name = service.dynamo_address()  # Still get component name from service definition
         logger.info(f"Registering component {namespace}/{component_name}")
         component = runtime.namespace(namespace).component(component_name)
 

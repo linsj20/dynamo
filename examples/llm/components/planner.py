@@ -29,6 +29,7 @@ from rich.table import Table
 from tensorboardX import SummaryWriter
 from utils.prefill_queue import PrefillQueue
 
+from dynamo._core import Client
 from dynamo.llm import KvMetricsAggregator
 from dynamo.planner import KubernetesConnector, LocalConnector
 from dynamo.planner.defaults import LoadPlannerDefaults
@@ -66,8 +67,8 @@ class Planner:
         )
         self._prefill_queue_stream_name = f"{self.namespace}_prefill_queue"
 
-        self.prefill_client: Any | None = None
-        self.workers_client: Any | None = None
+        self.prefill_client: Client | None = None
+        self.workers_client: Client | None = None
         self.p_endpoints: List[int] = []
         self.d_endpoints: List[int] = []
         self.decode_worker_remaining_grace_period = 0
@@ -394,15 +395,11 @@ async def start_planner(runtime: DistributedRuntime, args: argparse.Namespace):
         table.add_column("Endpoint", style="green")
         
         for component in components:
-            try:
-                data = json.loads(component["value"].decode("utf-8"))
-                if "component" in data:
-                    name = data["component"]
-                    endpoint = data["endpoint"]
-                    table.add_row(name, endpoint)
-            except Exception:
-                # Some entries may not be valid JSON or might be binary data
-                pass
+            data = json.loads(component["value"].decode("utf-8"))
+            if "component" in data:
+                name = data["component"]
+                endpoint = data["endpoint"]
+                table.add_row(name, endpoint)
         
         console.print(table)
     else:
