@@ -3,12 +3,14 @@
 
 # PD Disaggregated Low SLO Configuration - Optimized for throughput
 # Uses GPUs 4-7, starts with 2 GPUs (1P+1D), can scale to 4 GPUs
+# GPU allocation: Low SLO pool uses physical GPUs 4-7
 Common:
   model: Qwen/Qwen2.5-3B-Instruct
   block-size: 64
   max-model-len: 8192
   kv-transfer-config: '{"kv_connector":"DynamoNixlConnector"}'
   router: kv-load
+  gpu-scope: "4-7"  # GPU scope for this pool
 
 Frontend:
   served_model_name: Qwen/Qwen2.5-3B-Instruct

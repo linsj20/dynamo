@@ -91,6 +91,11 @@ class ServiceMixin:
         # If we have global configs, use them to build service configs
         cls = self.__class__
         if hasattr(cls, "_global_service_configs"):
+            # Include the Common section from global configs for GPU scope and other common settings
+            if "Common" in cls._global_service_configs:
+                result["Common"] = cls._global_service_configs["Common"]
+                logger.debug(f"Added Common config: {result['Common']}")
+            
             for name, svc in all_services.items():
                 # Start with default config
                 config = {"workers": 1}

@@ -3,12 +3,14 @@
 
 # PD Disaggregated High SLO Configuration - Optimized for <1s response time
 # Uses GPUs 0-3, starts with 2 GPUs (1P+1D), can scale to 4 GPUs
+# GPU allocation: High SLO pool uses physical GPUs 0-3
 Common:
   model: Qwen/Qwen2.5-3B-Instruct
   block-size: 64
   max-model-len: 4096
   kv-transfer-config: '{"kv_connector":"DynamoNixlConnector"}'
   router: kv-load
+  gpu-scope: "0-3"  # GPU scope for this pool
 
 Frontend:
   served_model_name: Qwen/Qwen2.5-3B-Instruct

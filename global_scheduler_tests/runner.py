@@ -281,20 +281,16 @@ class ServiceManager:
             # Get next available DYNAMO_PORT using counter
             dynamo_port = self._get_next_dynamo_port()
             
-            # Convert GPU list to CUDA_VISIBLE_DEVICES format
-            gpu_range = ','.join(str(gpu) for gpu in gpu_list)
-            
             logger.info(f"  Starting {slo_level.upper()} SLO PD Disagg pool:")
-            logger.info(f"    - GPU range: {gpu_range} (planner will assign GPUs within this range)")
+            logger.info(f"    - GPU scope defined in config file")
             logger.info(f"    - HTTP port {port}, FastAPI port {dynamo_port}")
             logger.info(f"    - Starts with 1P+1D workers, can scale via planner")
             logger.info(f"    - Log: {log_file}")
             
-            # Set environment for this pool with GPU range
+            # Set environment for this pool
             env = os.environ.copy()
             env.update({
-                'CUDA_VISIBLE_DEVICES': gpu_range,
-                'DYN_DISABLE_AUTO_GPU_ALLOCATION': '0',  # Enable auto allocation within range
+                'DYN_DISABLE_AUTO_GPU_ALLOCATION': '0',  # Enable auto allocation within scope
                 'DYNAMO_PORT': str(dynamo_port),
                 'GLOBAL_SCHEDULER_HOST': 'localhost',
                 'GLOBAL_SCHEDULER_PORT': '3999',
