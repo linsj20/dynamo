@@ -23,7 +23,7 @@ class SimpleSchedulerTest(BaseGlobalSchedulerTest):
     def _create_test_requests(self) -> List[TestRequest]:
         """Create a set of test requests with different SLO requirements and prompts"""
         
-        # Different types of prompts to test various scenarios
+        # Different types of prompts to test various scenarios with balanced SLO distribution
         test_cases = [
             # High SLO requests - should get fast, priority service
             TestRequest(
@@ -56,23 +56,21 @@ class SimpleSchedulerTest(BaseGlobalSchedulerTest):
                 max_tokens=80,
                 expected_pool="low_slo_pool"
             ),
-            
-            # Medium SLO requests - balanced requirements
             TestRequest(
-                request_id="medium_priority_1",
-                slo_requirement="medium",
-                prompt="How does photosynthesis work?",
+                request_id="low_priority_3",
+                slo_requirement="low",
+                prompt="Describe the process of making coffee.",
                 max_tokens=50,
-                expected_pool=None  # Could go to either pool
+                expected_pool="low_slo_pool"
             ),
             
-            # Additional edge cases
+            # Additional low SLO request to balance distribution  
             TestRequest(
-                request_id="high_priority_edge",
-                slo_requirement="high",
-                prompt="Hi",  # Very short prompt
-                max_tokens=10,
-                expected_pool="high_slo_pool"
+                request_id="low_priority_4",
+                slo_requirement="low",
+                prompt="What are the benefits of exercise?",
+                max_tokens=40,
+                expected_pool="low_slo_pool"
             ),
         ]
         

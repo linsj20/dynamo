@@ -23,6 +23,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'components', 'glo
 
 from tests.test_base import BaseGlobalSchedulerTest
 from tests.test_simple import SimpleSchedulerTest
+from tests.test_scaling import ScalingTest
 from monitor import SystemMonitor
 
 # Configure logging
@@ -118,6 +119,39 @@ class ServiceManager:
                 logger.error(f"FAIL: etcd health check failed - check {log_file}")
                 return False
             logger.info("  PASS: etcd is healthy")
+            
+            # Clear stale model registrations from previous test runs
+            logger.info("  Cleaning up stale model registrations from etcd...")
+            cleanup_result = subprocess.run(
+                ['etcdctl', 'del', '--prefix', 'models/'], 
+                capture_output=True, timeout=10
+            )
+            if cleanup_result.returncode == 0:
+                logger.info("  PASS: Cleared stale model registrations")
+            else:
+                logger.warning(f"  WARNING: Could not clear model registrations: {cleanup_result.stderr.decode()}")
+                
+            # Also clear model deployment cards
+            mdc_cleanup_result = subprocess.run(
+                ['etcdctl', 'del', '--prefix', 'mdc/'], 
+                capture_output=True, timeout=10
+            )
+            if mdc_cleanup_result.returncode == 0:
+                logger.info("  PASS: Cleared stale model deployment cards")
+            else:
+                logger.warning(f"  WARNING: Could not clear model deployment cards: {mdc_cleanup_result.stderr.decode()}")
+                
+            # Also clear disaggregation router configurations if running PD disaggregated tests
+            if self.pd_disagg:
+                disagg_cleanup_result = subprocess.run(
+                    ['etcdctl', 'del', '--prefix', 'public/components/disagg_router/'], 
+                    capture_output=True, timeout=10
+                )
+                if disagg_cleanup_result.returncode == 0:
+                    logger.info("  PASS: Cleared stale disaggregation router configurations")
+                else:
+                    logger.warning(f"  WARNING: Could not clear disaggregation router configurations: {disagg_cleanup_result.stderr.decode()}")
+                
         except Exception as e:
             logger.error(f"FAIL: Failed to start etcd: {e} - check {log_file}")
             return False
@@ -453,6 +487,9 @@ class TestRunner:
             if self.test_type == "simple":
                 test_instance = SimpleSchedulerTest(self.config)
                 result = await test_instance.run()
+            elif self.test_type == "scaling":
+                test_instance = ScalingTest(self.config)
+                result = await test_instance.run()
             else:
                 logger.error(f"Unknown test type: {self.test_type}")
                 result = False
@@ -476,7 +513,7 @@ class TestRunner:
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Global Scheduler Complete Test Runner")
-    parser.add_argument("--test-type", choices=["simple"], default="simple",
+    parser.add_argument("--test-type", choices=["simple", "scaling"], default="simple",
                        help="Type of test to run (default: simple)")
     parser.add_argument("--deployment", choices=["local", "cluster", "custom"], default="local",
                        help="Deployment mode (default: local)")
