@@ -110,7 +110,7 @@ class Planner:
     async def async_init(self):
         import asyncio
 
-        await asyncio.sleep(30)
+        await asyncio.sleep(5)  # Reduced delay to ensure other services are ready
         logger.info("Calling start_planner")
         await start_planner(self.runtime, self.args)
         logger.info("Planner started")

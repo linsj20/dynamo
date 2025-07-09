@@ -83,6 +83,31 @@ class LocalConnector(PlannerConnector):
             logger.error(f"Failed to save state: {e}")
             return False
 
+    def _parse_gpu_scope(self, gpu_scope: str) -> List[str]:
+        """Parse gpu_scope string to get list of GPU IDs.
+        
+        Args:
+            gpu_scope: GPU scope string (e.g., "0,1,2,3" or "0-3")
+            
+        Returns:
+            List of GPU IDs
+        """
+        if not gpu_scope:
+            return []
+        
+        gpu_ids = []
+        for part in gpu_scope.split(','):
+            part = part.strip()
+            if '-' in part:
+                # Handle ranges like "0-3"
+                start, end = part.split('-')
+                gpu_ids.extend(str(i) for i in range(int(start), int(end) + 1))
+            else:
+                # Handle individual IDs
+                gpu_ids.append(part)
+        
+        return gpu_ids
+
     async def _get_available_gpus(self) -> List[str]:
         """Get list of unallocated GPU IDs.
 
@@ -90,8 +115,14 @@ class LocalConnector(PlannerConnector):
             List of available GPU IDs
         """
         state = await self._load_state()
-        system_resources = state.get("environment", {}).get("SYSTEM_RESOURCES", {})
-        all_gpus = set(str(gpu) for gpu in system_resources.get("gpu_info", []))
+        
+        # If gpu_scope is set, use it as the available GPU pool
+        if self.gpu_scope:
+            all_gpus = set(self._parse_gpu_scope(self.gpu_scope))
+        else:
+            # Fallback to system resources
+            system_resources = state.get("environment", {}).get("SYSTEM_RESOURCES", {})
+            all_gpus = set(str(gpu) for gpu in system_resources.get("gpu_info", []))
 
         allocated_gpus: set[str] = set()
         for component_info in state.get("components", {}).values():
@@ -99,6 +130,8 @@ class LocalConnector(PlannerConnector):
             gpu_list = resources.get("allocated_gpus", [])
             allocated_gpus.update(str(gpu) for gpu in gpu_list)
 
+        logger.info(f"GPU scope: {self.gpu_scope}")
+        logger.info(f"All GPUs: {all_gpus}")
         logger.info(f"Allocated GPUs: {allocated_gpus}")
         available = sorted(list(all_gpus - allocated_gpus))
         logger.info(f"Available GPUs: {available}")
@@ -131,9 +164,10 @@ class LocalConnector(PlannerConnector):
 
         watcher_name = f"{self.namespace}_{component_name}_{max_suffix + 1}"
 
-        if component_name not in [
-            c.replace(f"{self.namespace}_", "") for c in state["components"]
-        ]:
+        available_components = [c.replace(f"{self.namespace}_", "") for c in state["components"]]
+        logger.info(f"State components: {list(state['components'].keys())}, Available after namespace strip: {available_components}")
+        
+        if component_name not in available_components:
             raise ValueError(
                 f"Component {component_name} not found in state configuration"
             )
@@ -145,18 +179,35 @@ class LocalConnector(PlannerConnector):
 
         # Build environment
         watcher_env = os.environ.copy()
+        gpu_id = None
         if component_name in ["VllmWorker", "PrefillWorker"]:
-            if self.gpu_scope:
-                # Use gpu_scope to set CUDA_VISIBLE_DEVICES
-                watcher_env["CUDA_VISIBLE_DEVICES"] = self.gpu_scope
-                logger.info(f"Setting CUDA_VISIBLE_DEVICES to gpu_scope: {self.gpu_scope}")
-            else:
-                # Fallback to original behavior
-                available_gpus = await self._get_available_gpus()
-                if not available_gpus:
-                    raise ValueError("No GPUs available for allocation")
-                gpu_id = available_gpus[0]
-                watcher_env["CUDA_VISIBLE_DEVICES"] = gpu_id
+            # Always use the GPU allocation logic to get individual GPUs
+            # Reload state to ensure we have the latest GPU allocations
+            state = await self._load_state()
+            available_gpus = await self._get_available_gpus()
+            if not available_gpus:
+                raise ValueError("No GPUs available for allocation")
+            gpu_id = available_gpus[0]
+            watcher_env["CUDA_VISIBLE_DEVICES"] = gpu_id
+            logger.info(f"Setting CUDA_VISIBLE_DEVICES to individual GPU: {gpu_id}")
+            
+            # IMMEDIATELY mark GPU as allocated to prevent race conditions
+            # Add GPU to allocated_gpus list (should be empty for new workers)
+            existing_resources = state["components"].get(watcher_name, {}).get("resources", {})
+            allocated_gpus = existing_resources.get("allocated_gpus", [])
+            assert gpu_id not in allocated_gpus, f"GPU {gpu_id} already allocated"
+            allocated_gpus.append(gpu_id)
+            
+            resources = existing_resources.copy()
+            resources["allocated_gpus"] = allocated_gpus
+            
+            state["components"][watcher_name] = {
+                "watcher_name": watcher_name,
+                "cmd": "pending",  # Will be updated after successful start
+                "resources": resources,
+            }
+            await self._save_state(state)
+            logger.info(f"Pre-allocated GPU {gpu_id} for {watcher_name} (allocated_gpus: {allocated_gpus})")
 
         watcher_env["DYNAMO_SERVICE_CONFIG"] = service_config
 
@@ -175,27 +226,35 @@ class LocalConnector(PlannerConnector):
         )
 
         if success:
-            resources = {}
-            if component_name in ["VllmWorker", "PrefillWorker"]:
-                if self.gpu_scope:
-                    # When using gpu_scope, record the scope instead of specific GPU IDs
-                    resources["gpu_scope"] = self.gpu_scope
-                else:
-                    resources["allocated_gpus"] = [gpu_id]
-
-            state["components"][watcher_name] = {
-                "watcher_name": watcher_name,
-                "cmd": full_cmd,
-                "resources": resources,
-            }
+            # Update the command in the state now that worker started successfully
+            if watcher_name in state["components"]:
+                state["components"][watcher_name]["cmd"] = full_cmd
+            else:
+                # Non-GPU component
+                resources = {}
+                state["components"][watcher_name] = {
+                    "watcher_name": watcher_name,
+                    "cmd": full_cmd,
+                    "resources": resources,
+                }
             await self._save_state(state)
             logger.info(
                 f"Succesfully created {watcher_name}. Waiting for worker to start..."
             )
+        else:
+            # Worker failed to start, clean up GPU allocation
+            if component_name in ["VllmWorker", "PrefillWorker"] and watcher_name in state["components"]:
+                logger.error(f"Worker {watcher_name} failed to start, releasing GPU {gpu_id}")
+                del state["components"][watcher_name]
+                await self._save_state(state)
+            raise RuntimeError(f"Failed to start watcher {watcher_name}")
 
         if blocking:
             required_endpoint_ids = pre_add_endpoint_ids + 1
-            while True:
+            max_retries = 30  # Wait up to 150 seconds (30 * 5 seconds)
+            retry_count = 0
+            
+            while retry_count < max_retries:
                 current_endpoint_ids = await self._count_instance_ids(component_name)
                 if current_endpoint_ids == required_endpoint_ids:
                     break
@@ -203,6 +262,18 @@ class LocalConnector(PlannerConnector):
                     f"Waiting for {component_name} to start. Current endpoint IDs: {current_endpoint_ids}, Required endpoint IDs: {required_endpoint_ids}"
                 )
                 await asyncio.sleep(5)
+                retry_count += 1
+                
+            if retry_count >= max_retries:
+                # Worker failed to start within timeout, clean up GPU allocation
+                logger.error(f"Worker {watcher_name} failed to start within timeout, cleaning up GPU allocation")
+                if component_name in ["VllmWorker", "PrefillWorker"] and watcher_name in state["components"]:
+                    del state["components"][watcher_name]
+                    await self._save_state(state)
+                    
+                # Also try to remove the circus watcher
+                await self.circus.remove_watcher(name=watcher_name, blocking=False)
+                return False
 
         return success
 

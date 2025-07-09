@@ -10,7 +10,7 @@ Common:
   max-model-len: 8192
   kv-transfer-config: '{"kv_connector":"DynamoNixlConnector"}'
   router: kv-load
-  gpu-scope: "4-7"  # GPU scope for this pool
+  gpu-scope: "4,5,6,7"  # GPU scope for this pool
 
 Frontend:
   served_model_name: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
@@ -35,7 +35,7 @@ Router:
     dynamo:
       namespace: low_slo_pd
 
-# Decode workers - start with 1, can scale via planner
+# Decode workers - planner will auto-launch minimum required workers
 VllmWorker:
   remote-prefill: true
   conditional-disagg: false  # Always use remote prefill for consistent performance
@@ -44,19 +44,19 @@ VllmWorker:
   max-num-seqs: 64
   gpu-memory-utilization: 0.85  # Reduce memory usage
   ServiceArgs:
-    workers: 1  # Start with 1 decode worker
+    workers: 0  # Planner will auto-launch minimum required workers
     resources:
       gpu: '1'   # 1 GPU per decode worker (planner assigns within range)
     dynamo:
       namespace: low_slo_pd
   common-configs: [model, block-size, max-model-len, kv-transfer-config]
 
-# Prefill workers - start with 1, can scale via planner
+# Prefill workers - planner will auto-launch minimum required workers
 PrefillWorker:
   max-num-batched-tokens: 16384  # Higher batch size for prefill throughput
   gpu-memory-utilization: 0.85  # Reduce memory usage
   ServiceArgs:
-    workers: 1  # Start with 1 prefill worker
+    workers: 0  # Planner will auto-launch minimum required workers
     resources:
       gpu: '1'   # 1 GPU per prefill worker (planner assigns within range)
     dynamo:
@@ -65,7 +65,7 @@ PrefillWorker:
 
 # Planner for automatic scaling
 Planner:
-  environment: local
+  environment: local  # CRITICAL: This enables local planner and state file creation
   no-operation: false
   metric-pulling-interval: 1
   adjustment-interval: 10

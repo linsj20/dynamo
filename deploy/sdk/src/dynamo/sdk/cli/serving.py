@@ -422,6 +422,32 @@ def serve_dynamo_graph(
                 for watcher in watchers
             }
 
+            # CRITICAL FIX: Add all services from the configuration to the state file, even if they have 0 workers
+            # This ensures the planner can find base configurations for services it wants to scale
+            
+            # Get all services from configuration, not just graph dependencies
+            from dynamo.sdk.lib.config import ServiceConfig
+            config = ServiceConfig.get_instance()
+            all_config_services = set(config.keys())
+            all_graph_services = set(svc.all_services().keys())
+            
+            # Combine services from both graph and configuration
+            all_services_to_add = all_graph_services.union(all_config_services)
+            # Remove 'Common' as it's not a service
+            all_services_to_add.discard('Common')
+            
+            for service_name in all_services_to_add:
+                component_name = f"{namespace}_{service_name}"
+                if component_name not in components_dict:
+                    # Create a base configuration for services with 0 workers
+                    base_cmd = f"python -m {_DYNAMO_WORKER_SCRIPT} {graph} --service-name {service_name} --worker-id $(CIRCUS.WID) --target {target.value}"
+                    components_dict[component_name] = {
+                        "watcher_name": component_name,
+                        "cmd": base_cmd,
+                        "resources": {},
+                    }
+                    logger.info(f"Added base configuration for {component_name} (0 workers)")
+            
             save_dynamo_state(
                 namespace,
                 arbiter.endpoint,

@@ -84,8 +84,6 @@ class Router:
     Request handler for the generate endpoint
     """
 
-    worker = depends(VllmWorker)
-
     def __init__(self):
         logger.info("Initializing Custom Router")
         self.args = parse_args(self.__class__.__name__, "")

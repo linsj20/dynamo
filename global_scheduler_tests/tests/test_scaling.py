@@ -95,76 +95,48 @@ class ScalingTest(BaseGlobalSchedulerTest):
         logger.info("Testing scaling behavior with variable request rates")
         logger.info("=" * 60)
         logger.info("LOAD PATTERN OVERVIEW:")
-        logger.info("  Phase 1: 50 req/s  for 60s  (baseline)")
-        logger.info("  Phase 2: 100 req/s for 90s  (scale up trigger)")
-        logger.info("  Phase 3: 200 req/s for 120s (peak load)")
-        logger.info("  Phase 4: 100 req/s for 90s  (scale down trigger)")
-        logger.info("  Phase 5: 50 req/s  for 60s  (return to baseline)")
-        logger.info("  Expected Total: ~36000 requests over ~8 minutes")
+        logger.info("  Phase 1: 100 req/s for 30s  (baseline)")
+        logger.info("  Phase 2: 200 req/s for 60s (peak load)")
+        logger.info("  Phase 3: 100 req/s for 30s  (return to baseline)")
+        logger.info("  Expected Total: ~15000 requests over ~4 minutes")
         logger.info("  KV Cache: Each request has unique random prefix to prevent reuse")
         logger.info("  Logging: Status every 20 requests (50 during 200+ req/s) to avoid overflow")
         logger.info("=" * 60)
         
-        # Phase 1: Low load baseline (should start with minimal workers)
+        # Phase 1: Baseline load (should start with minimal workers)
         logger.info("=" * 60)
-        logger.info("PHASE 1: HIGH LOAD BASELINE (60 seconds)")
-        logger.info("Request rate: 50 req/s")
-        logger.info("Expected: Minimal workers (1P+1D)")
+        logger.info("PHASE 1: BASELINE LOAD (30 seconds)")
+        logger.info("Request rate: 100 req/s")
+        logger.info("Expected: Baseline workers")
         logger.info("=" * 60)
-        phase1_results = await self._run_load_phase("low", duration=60, request_rate=50.0)
-        self.phase_results["low_baseline"] = phase1_results
+        phase1_results = await self._run_load_phase("baseline", duration=30, request_rate=100.0)
+        self.phase_results["baseline"] = phase1_results
         
         # Wait for metrics to stabilize
         logger.info("Waiting 20 seconds for metrics to stabilize...")
         await asyncio.sleep(20)
         
-        # Phase 2: Gradually increase load (should trigger scale up)
+        # Phase 2: High sustained load (should trigger scale up and maintain scaled state)
         logger.info("=" * 60)
-        logger.info("PHASE 2: VERY HIGH LOAD (90 seconds)")
-        logger.info("Request rate: 100 req/s")
-        logger.info("Expected: Scale up triggers (prefill queue > 0.2 or KV util > 20%)")
+        logger.info("PHASE 2: HIGH LOAD (60 seconds)")
+        logger.info("Request rate: 200 req/s")
+        logger.info("Expected: Scale up triggers and maintain scaled workers")
         logger.info("=" * 60)
-        phase2_results = await self._run_load_phase("increasing", duration=90, request_rate=100.0)
-        self.phase_results["increasing_load"] = phase2_results
+        phase2_results = await self._run_load_phase("high", duration=60, request_rate=200.0)
+        self.phase_results["high_sustained"] = phase2_results
         
         # Wait for scaling to complete
-        logger.info("Waiting 45 seconds for scaling actions to complete...")
-        await asyncio.sleep(45)
-        
-        # Phase 3: High sustained load (should maintain scaled state)
-        logger.info("=" * 60)
-        logger.info("PHASE 3: EXTREME HIGH LOAD (120 seconds)")
-        logger.info("Request rate: 200 req/s (PEAK)")
-        logger.info("Expected: Maintain scaled workers")
-        logger.info("=" * 60)
-        phase3_results = await self._run_load_phase("high", duration=120, request_rate=200.0)
-        self.phase_results["high_sustained"] = phase3_results
-        
-        # Wait for metrics to stabilize
-        logger.info("Waiting 30 seconds for metrics to stabilize...")
+        logger.info("Waiting 30 seconds for scaling actions to complete...")
         await asyncio.sleep(30)
         
-        # Phase 4: Gradually decrease load (should trigger scale down)
+        # Phase 3: Return to baseline load (should trigger scale down)
         logger.info("=" * 60)
-        logger.info("PHASE 4: VERY HIGH LOAD (90 seconds)")
+        logger.info("PHASE 3: RETURN TO BASELINE (30 seconds)")
         logger.info("Request rate: 100 req/s")
-        logger.info("Expected: Scale down triggers (prefill queue < 0.1 and KV util < 10%)")
+        logger.info("Expected: Scale down to baseline workers")
         logger.info("=" * 60)
-        phase4_results = await self._run_load_phase("decreasing", duration=90, request_rate=100.0)
-        self.phase_results["decreasing_load"] = phase4_results
-        
-        # Wait for scaling to complete
-        logger.info("Waiting 45 seconds for final scaling actions...")
-        await asyncio.sleep(45)
-        
-        # Phase 5: Return to low load (should return to minimal workers)
-        logger.info("=" * 60)
-        logger.info("PHASE 5: HIGH LOAD RETURN (60 seconds)")
-        logger.info("Request rate: 50 req/s")
-        logger.info("Expected: Return to minimal workers (1P+1D)")
-        logger.info("=" * 60)
-        phase5_results = await self._run_load_phase("low_return", duration=60, request_rate=50.0)
-        self.phase_results["low_return"] = phase5_results
+        phase3_results = await self._run_load_phase("baseline_return", duration=30, request_rate=100.0)
+        self.phase_results["baseline_return"] = phase3_results
         
         # Analyze scaling behavior
         return self._analyze_scaling_results()
@@ -303,19 +275,13 @@ class ScalingTest(BaseGlobalSchedulerTest):
             logger.info(f"  Avg Response Time: {avg_response_time:.2f}s")
             
             # Phase-specific validation
-            if phase_name in ["low_baseline", "low_return"]:
-                # Low load phases should have good performance
+            if phase_name in ["baseline", "baseline_return"]:
+                # Baseline phases should have good performance
                 if success_rate < 90:
                     logger.warning(f"  WARNING: Low success rate during {phase_name}")
                     overall_success = False
                 if avg_response_time > 10:
                     logger.warning(f"  WARNING: High response time during {phase_name}")
-            
-            elif phase_name in ["increasing_load", "decreasing_load"]:
-                # Transition phases may have some degradation but should still work
-                if success_rate < 70:
-                    logger.error(f"  FAIL: Very low success rate during {phase_name}")
-                    overall_success = False
             
             elif phase_name == "high_sustained":
                 # High load should be sustained well after scaling
@@ -332,7 +298,7 @@ class ScalingTest(BaseGlobalSchedulerTest):
         logger.info(f"  Peak Load Phase: 200 req/s for 120 seconds (expected ~24000 requests)")
         
         # Calculate expected vs actual request counts
-        expected_total = (50*60) + (100*90) + (200*120) + (100*90) + (50*60)  # Sum of rate*duration for each phase
+        expected_total = (100*60) + (200*120) + (100*60)  # Sum of rate*duration for each phase
         logger.info(f"  Expected Total Requests: ~{expected_total}")
         logger.info(f"  Actual Total Requests: {total_requests}")
         

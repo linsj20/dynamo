@@ -343,7 +343,9 @@ class ServiceManager:
                     f'--Processor.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
                     f'--Router.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
                     f'--VllmWorker.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
+                    f'--VllmWorker.ServiceArgs.workers=0',  # Preserve workers: 0 from config
                     f'--PrefillWorker.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
+                    f'--PrefillWorker.ServiceArgs.workers=0',  # Preserve workers: 0 from config
                     f'--Planner.ServiceArgs.dynamo.namespace={slo_level}_slo_pd'
                 ], stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
                 

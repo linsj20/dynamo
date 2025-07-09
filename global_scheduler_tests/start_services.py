@@ -226,6 +226,9 @@ class ServiceManager:
                     f'--Processor.ServiceArgs.dynamo.namespace={slo_level}_slo',
                     f'--Router.ServiceArgs.dynamo.namespace={slo_level}_slo',
                     f'--VllmWorker.ServiceArgs.dynamo.namespace={slo_level}_slo',
+                    f'--VllmWorker.ServiceArgs.workers=0',  # Override workers to 0 for planner control
+                    f'--PrefillWorker.ServiceArgs.dynamo.namespace={slo_level}_slo',
+                    f'--PrefillWorker.ServiceArgs.workers=0',  # Override workers to 0 for planner control
                     f'--Planner.ServiceArgs.dynamo.namespace={slo_level}_slo'
                 ], stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
                 

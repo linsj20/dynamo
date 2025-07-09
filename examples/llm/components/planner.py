@@ -253,6 +253,7 @@ class Planner:
         if (
             avg_prefill_queue_load < self.args.prefill_queue_scale_down_threshold
             and len(self.p_endpoints) > self.args.min_endpoint
+            and len(self.p_endpoints) > 1
         ):
             logger.info(
                 f"Average prefill queue load ({avg_prefill_queue_load:.2f}) is below threshold ({self.args.prefill_queue_scale_down_threshold:.2f}), scaling down prefill workers"
@@ -265,6 +266,7 @@ class Planner:
         if (
             avg_kv_load < self.args.decode_kv_scale_down_threshold
             and len(self.d_endpoints) > self.args.min_endpoint
+            and len(self.p_endpoints) > 1
         ):
             if self.decode_worker_remaining_grace_period > 0:
                 logger.info(
@@ -353,6 +355,28 @@ class Planner:
         if self.decode_worker_remaining_grace_period > 0:
             self.decode_worker_remaining_grace_period -= 1
 
+    async def ensure_minimum_workers(self):
+        """Launch 1 prefill worker and 1 decode worker"""
+        logger.info("Launching 1 prefill worker and 1 decode worker...")
+        
+        # Launch 1 prefill worker
+        success = await self.connector.add_component("PrefillWorker", blocking=True)
+        if success:
+            logger.info("Successfully launched prefill worker")
+        else:
+            logger.error("Failed to launch prefill worker")
+        
+        # Launch 1 decode worker
+        success = await self.connector.add_component("VllmWorker", blocking=True)
+        if success:
+            logger.info("Successfully launched decode worker")
+        else:
+            logger.error("Failed to launch decode worker")
+        
+        # Log current state after launching workers
+        p_endpoints_final, d_endpoints_final = await self.get_workers_info()
+        logger.info(f"After launching workers: {len(p_endpoints_final)} prefill workers, {len(d_endpoints_final)} decode workers")
+
     async def run(self):
         """Main loop for the planner"""
 
@@ -362,6 +386,10 @@ class Planner:
             logger.info(
                 "Running in no-operation mode - detailed metrics will be logged at DEBUG level"
             )
+
+        # Launch initial workers
+        logger.info("Launching initial workers...")
+        await self.ensure_minimum_workers()
 
         await self.reset_adjustment_interval()
 
@@ -382,7 +410,7 @@ class Planner:
                 >= self.args.adjustment_interval
             ):
                 if not self.args.no_operation:
-                    # blockingly make adjustments to avoid overcompensation
+                    # Make load-based adjustments
                     await self.make_adjustments()
                 await self.reset_adjustment_interval()
 

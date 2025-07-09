@@ -311,7 +311,7 @@ class ResourceAllocator:
                     )
 
         # Determine number of workers - runtime config takes precedence
-        if config.get("workers"):
+        if "workers" in config:
             num_workers = config["workers"]
             logger.info(f"Using runtime configured worker count: {num_workers}")
         elif service_resources and hasattr(service.config, 'workers'):
