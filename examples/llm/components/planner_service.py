@@ -54,8 +54,15 @@ class Planner:
         self.namespace = dynamo_context["namespace"]
         config_instance = config.get("Planner", {})
 
+        # Extract gpu_scope from Common configuration
+        common_config = config.get("Common", {})
+        gpu_scope = common_config.get("gpu-scope", None)
+        if gpu_scope:
+            logger.info(f"Using GPU scope from Common config: {gpu_scope}")
+
         self.args = argparse.Namespace(
             namespace=self.namespace,
+            gpu_scope=gpu_scope,
             environment=config_instance.get(
                 "environment", LoadPlannerDefaults.environment
             ),

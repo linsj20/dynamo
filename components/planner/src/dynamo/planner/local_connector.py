@@ -32,16 +32,18 @@ logger = logging.getLogger(__name__)
 
 
 class LocalConnector(PlannerConnector):
-    def __init__(self, namespace: str, runtime: DistributedRuntime):
+    def __init__(self, namespace: str, runtime: DistributedRuntime, gpu_scope: str = None):
         """
         Initialize LocalConnector and connect to CircusController.
 
         Args:
             namespace: The Dynamo namespace
             runtime: Optional DistributedRuntime instance
+            gpu_scope: GPU scope string to limit available GPUs (e.g., "0,1,2,3" or "0-3")
         """
         self.namespace = namespace
         self.runtime = runtime
+        self.gpu_scope = gpu_scope
         self.state_file = Path.home() / ".dynamo" / "state" / f"{namespace}.json"
         self.circus = CircusController.from_state_file(namespace)
         self._lockfile = self.state_file.with_suffix(".lock")
@@ -144,11 +146,17 @@ class LocalConnector(PlannerConnector):
         # Build environment
         watcher_env = os.environ.copy()
         if component_name in ["VllmWorker", "PrefillWorker"]:
-            available_gpus = await self._get_available_gpus()
-            if not available_gpus:
-                raise ValueError("No GPUs available for allocation")
-            gpu_id = available_gpus[0]
-            watcher_env["CUDA_VISIBLE_DEVICES"] = gpu_id
+            if self.gpu_scope:
+                # Use gpu_scope to set CUDA_VISIBLE_DEVICES
+                watcher_env["CUDA_VISIBLE_DEVICES"] = self.gpu_scope
+                logger.info(f"Setting CUDA_VISIBLE_DEVICES to gpu_scope: {self.gpu_scope}")
+            else:
+                # Fallback to original behavior
+                available_gpus = await self._get_available_gpus()
+                if not available_gpus:
+                    raise ValueError("No GPUs available for allocation")
+                gpu_id = available_gpus[0]
+                watcher_env["CUDA_VISIBLE_DEVICES"] = gpu_id
 
         watcher_env["DYNAMO_SERVICE_CONFIG"] = service_config
 
@@ -169,7 +177,11 @@ class LocalConnector(PlannerConnector):
         if success:
             resources = {}
             if component_name in ["VllmWorker", "PrefillWorker"]:
-                resources["allocated_gpus"] = [gpu_id]
+                if self.gpu_scope:
+                    # When using gpu_scope, record the scope instead of specific GPU IDs
+                    resources["gpu_scope"] = self.gpu_scope
+                else:
+                    resources["allocated_gpus"] = [gpu_id]
 
             state["components"][watcher_name] = {
                 "watcher_name": watcher_name,

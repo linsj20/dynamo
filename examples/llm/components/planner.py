@@ -35,6 +35,7 @@ from dynamo.planner import KubernetesConnector, LocalConnector
 from dynamo.planner.defaults import LoadPlannerDefaults
 from dynamo.runtime import DistributedRuntime, dynamo_worker
 from dynamo.runtime.logging import configure_dynamo_logging
+from dynamo.sdk.lib.config import ServiceConfig
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
@@ -56,7 +57,18 @@ class Planner:
         self.args = args
         self.namespace = args.namespace
         if args.environment == "local":
-            self.connector = LocalConnector(args.namespace, runtime)
+            # Extract gpu_scope from args or Common configuration
+            gpu_scope = getattr(args, 'gpu_scope', None)
+            if not gpu_scope:
+                config = ServiceConfig.get_instance()
+                common_config = config.get("Common", {})
+                gpu_scope = common_config.get("gpu-scope")
+                if gpu_scope:
+                    logger.info(f"Using GPU scope from Common config: {gpu_scope}")
+            else:
+                logger.info(f"Using GPU scope from args: {gpu_scope}")
+            
+            self.connector = LocalConnector(args.namespace, runtime, gpu_scope)
         elif args.environment == "kubernetes":
             self.connector = KubernetesConnector(args.namespace)
         else:
