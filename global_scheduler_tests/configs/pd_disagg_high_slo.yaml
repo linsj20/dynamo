@@ -13,8 +13,8 @@ Common:
   gpu-scope: "0,1,2,3"  # GPU scope for this pool
 
 Frontend:
-  served_model_name: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
-  endpoint: dynamo.Processor.chat/completions
+  served_model_name: deepseek-ai/DeepSeek-R1-Distill-Llama-8B-high-slo
+  endpoint: high_slo_pd.Processor.chat/completions
   port: 8000
   router: round-robin
   common-configs: [block-size]

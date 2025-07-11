@@ -40,9 +40,15 @@ logging.getLogger('requests').setLevel(logging.WARNING)
 class ServiceManager:
     """Manages the lifecycle of services needed for Global Scheduler testing"""
     
-    def __init__(self, config_dir: str = "configs", pd_disagg: bool = False):
+    def __init__(self, config_dir: str = "configs", pd_disagg: bool = False, 
+                 multinode: bool = False, head_node_ip: str = None, 
+                 head_node_role: str = None, worker_only: bool = False):
         self.config_dir = config_dir
         self.pd_disagg = pd_disagg
+        self.multinode = multinode
+        self.head_node_ip = head_node_ip
+        self.head_node_role = head_node_role
+        self.worker_only = worker_only
         self.processes: Dict[str, subprocess.Popen] = {}
         self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         
@@ -83,18 +89,32 @@ class ServiceManager:
         
     def start_all_services(self) -> bool:
         """Start all required services for testing"""
-        logger.info("Starting all services for Global Scheduler testing...")
+        if self.multinode:
+            logger.info(f"Starting multinode services for Global Scheduler testing...")
+            logger.info(f"Node role: {self.head_node_role}")
+            logger.info(f"Head node IP: {self.head_node_ip}")
+            logger.info(f"Worker only: {self.worker_only}")
+        else:
+            logger.info("Starting all services for Global Scheduler testing...")
         logger.info(f"Logs will be written to: {self.logs_dir}/")
         
-        if not self._start_infrastructure():
-            logger.error("Failed to start infrastructure services")
-            return False
-        if not self._start_global_scheduler():
-            logger.error("Failed to start Global Scheduler")
-            return False
-        if not self._start_pools():
-            logger.error("Failed to start SLO pools")
-            return False
+        if self.multinode and self.worker_only:
+            # Worker node - only start pools, no infrastructure or global scheduler
+            logger.info("Worker node - starting only pools...")
+            if not self._start_pools():
+                logger.error("Failed to start SLO pools")
+                return False
+        else:
+            # Head node - start infrastructure, global scheduler, and pools
+            if not self._start_infrastructure():
+                logger.error("Failed to start infrastructure services")
+                return False
+            if not self._start_global_scheduler():
+                logger.error("Failed to start Global Scheduler")
+                return False
+            if not self._start_pools():
+                logger.error("Failed to start SLO pools")
+                return False
             
         logger.info("All services started successfully")
         return True
@@ -210,31 +230,59 @@ class ServiceManager:
         """Start the high and low SLO pools"""
         logger.info("Starting SLO pools...")
         
-        if self.pd_disagg:
-            # Start high SLO pool with PD disaggregated architecture
-            if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus):
-                return False
-                
-            # Start low SLO pool with PD disaggregated architecture  
-            if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus):
+        if self.multinode:
+            # Multinode deployment - determine which pools to start based on node role
+            if self.head_node_role == "head_and_high_slo":
+                # Head node runs high SLO pool only
+                if self.pd_disagg:
+                    if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus, multinode=True):
+                        return False
+                else:
+                    if not self._start_pool('high', 8000, '0,1,2,3', multinode=True):
+                        return False
+            elif self.head_node_role == "low_slo":
+                # Worker node runs low SLO pool only
+                if self.pd_disagg:
+                    if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus, multinode=True):
+                        return False
+                else:
+                    if not self._start_pool('low', 8002, '0,1,2,3', multinode=True):
+                        return False
+            else:
+                logger.error(f"Unknown node role: {self.head_node_role}")
                 return False
         else:
-            # Start high SLO pool with original single-GPU setup
-            if not self._start_pool('high', 8000, '0'):
-                return False
-                
-            # Start low SLO pool with original single-GPU setup
-            if not self._start_pool('low', 8002, '1'):
-                return False
+            # Single node deployment - start both pools
+            if self.pd_disagg:
+                # Start high SLO pool with PD disaggregated architecture
+                if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus):
+                    return False
+                    
+                # Start low SLO pool with PD disaggregated architecture  
+                if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus):
+                    return False
+            else:
+                # Start high SLO pool with original single-GPU setup
+                if not self._start_pool('high', 8000, '0'):
+                    return False
+                    
+                # Start low SLO pool with original single-GPU setup
+                if not self._start_pool('low', 8002, '1'):
+                    return False
             
         return True
     
-    def _start_pool(self, slo_level: str, port: int, gpu: str) -> bool:
+    def _start_pool(self, slo_level: str, port: int, gpu: str, multinode: bool = False) -> bool:
         """Start a specific SLO pool"""
         log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pool.log')
         
         try:
-            config_file = os.path.join(self.config_dir, f'simple_{slo_level}_slo.yaml')
+            # Choose configuration file based on multinode deployment
+            if multinode:
+                config_file = os.path.join(self.config_dir, f'multinode_simple_{slo_level}_slo.yaml')
+            else:
+                config_file = os.path.join(self.config_dir, f'simple_{slo_level}_slo.yaml')
+                
             if not os.path.exists(config_file):
                 logger.error(f"FAIL: Config file not found: {config_file}")
                 return False
@@ -253,7 +301,7 @@ class ServiceManager:
                 'CUDA_VISIBLE_DEVICES': gpu,
                 'DYN_DISABLE_AUTO_GPU_ALLOCATION': '1',
                 'DYNAMO_PORT': str(dynamo_port),  # Use dynamic port counter
-                'GLOBAL_SCHEDULER_HOST': 'localhost',
+                'GLOBAL_SCHEDULER_HOST': self.head_node_ip if multinode else 'localhost',
                 'GLOBAL_SCHEDULER_PORT': '3999',
                 'POOL_HOST': 'localhost'
             })
@@ -261,17 +309,27 @@ class ServiceManager:
             # Change to examples/llm directory
             llm_dir = os.path.join(self.project_root, 'examples', 'llm')
             
+            # For multinode, we need to adjust the namespace, but for local mode we preserve the config file settings
+            cmd_args = [
+                'dynamo', 'serve', 'graphs.agg_router:Frontend',
+                '-f', config_file,
+                f'--Frontend.port={port}'
+            ]
+            
+            # Only override namespace for multinode deployment
+            if multinode:
+                namespace_suffix = "_multinode"
+                namespace = f"{slo_level}_slo{namespace_suffix}"
+                cmd_args.extend([
+                    f'--Frontend.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--Processor.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--Router.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--VllmWorker.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--Planner.ServiceArgs.dynamo.namespace={namespace}'
+                ])
+            
             with open(log_file, 'w') as f:
-                process = subprocess.Popen([
-                    'dynamo', 'serve', 'graphs.agg_router:Frontend',
-                    '-f', config_file,
-                    f'--Frontend.port={port}',
-                    f'--Frontend.ServiceArgs.dynamo.namespace={slo_level}_slo',
-                    f'--Processor.ServiceArgs.dynamo.namespace={slo_level}_slo',
-                    f'--Router.ServiceArgs.dynamo.namespace={slo_level}_slo',
-                    f'--VllmWorker.ServiceArgs.dynamo.namespace={slo_level}_slo',
-                    f'--Planner.ServiceArgs.dynamo.namespace={slo_level}_slo'
-                ], stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
+                process = subprocess.Popen(cmd_args, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
                 
             self.processes[f'{slo_level}_pool'] = process
             
@@ -299,12 +357,17 @@ class ServiceManager:
             logger.error(f"FAIL: Failed to start {slo_level} SLO pool: {e} - check {log_file}")
             return False
     
-    def _start_pd_disagg_pool(self, slo_level: str, port: int, gpu_list: list) -> bool:
+    def _start_pd_disagg_pool(self, slo_level: str, port: int, gpu_list: list, multinode: bool = False) -> bool:
         """Start a specific SLO pool with PD disaggregated architecture"""
         log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pd_disagg_pool.log')
         
         try:
-            config_file = os.path.join(self.config_dir, f'pd_disagg_{slo_level}_slo.yaml')
+            # Choose configuration file based on multinode deployment
+            if multinode:
+                config_file = os.path.join(self.config_dir, f'multinode_pd_disagg_{slo_level}_slo.yaml')
+            else:
+                config_file = os.path.join(self.config_dir, f'pd_disagg_{slo_level}_slo.yaml')
+                
             if not os.path.exists(config_file):
                 logger.error(f"FAIL: Config file not found: {config_file}")
                 return False
@@ -326,7 +389,7 @@ class ServiceManager:
             env.update({
                 'DYN_DISABLE_AUTO_GPU_ALLOCATION': '0',  # Enable auto allocation within scope
                 'DYNAMO_PORT': str(dynamo_port),
-                'GLOBAL_SCHEDULER_HOST': 'localhost',
+                'GLOBAL_SCHEDULER_HOST': self.head_node_ip if multinode else 'localhost',
                 'GLOBAL_SCHEDULER_PORT': '3999',
                 'POOL_HOST': 'localhost'
             })
@@ -334,20 +397,28 @@ class ServiceManager:
             # Change to examples/llm directory
             llm_dir = os.path.join(self.project_root, 'examples', 'llm')
             
+            # For multinode, we need to adjust the namespace, but for local mode we preserve the config file settings
+            cmd_args = [
+                'dynamo', 'serve', 'graphs.disagg_router:Frontend',
+                '-f', config_file,
+                f'--Frontend.port={port}'
+            ]
+            
+            # Only override namespace for multinode deployment
+            if multinode:
+                namespace_suffix = "_multinode"
+                namespace = f"{slo_level}_slo_pd{namespace_suffix}"
+                cmd_args.extend([
+                    f'--Frontend.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--Processor.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--Router.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--VllmWorker.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--PrefillWorker.ServiceArgs.dynamo.namespace={namespace}',
+                    f'--Planner.ServiceArgs.dynamo.namespace={namespace}'
+                ])
+            
             with open(log_file, 'w') as f:
-                process = subprocess.Popen([
-                    'dynamo', 'serve', 'graphs.disagg_router:Frontend',
-                    '-f', config_file,
-                    f'--Frontend.port={port}',
-                    f'--Frontend.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
-                    f'--Processor.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
-                    f'--Router.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
-                    f'--VllmWorker.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
-                    f'--VllmWorker.ServiceArgs.workers=0',  # Preserve workers: 0 from config
-                    f'--PrefillWorker.ServiceArgs.dynamo.namespace={slo_level}_slo_pd',
-                    f'--PrefillWorker.ServiceArgs.workers=0',  # Preserve workers: 0 from config
-                    f'--Planner.ServiceArgs.dynamo.namespace={slo_level}_slo_pd'
-                ], stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
+                process = subprocess.Popen(cmd_args, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
                 
             self.processes[f'{slo_level}_pd_disagg_pool'] = process
             
@@ -406,14 +477,19 @@ class TestRunner:
     """Main test runner that orchestrates the complete test lifecycle"""
     
     def __init__(self, test_type: str = "simple", deployment: str = "local", 
-                 config_dir: str = "configs", start_services: bool = True, monitor: bool = False, pd_disagg: bool = False):
+                 config_dir: str = "configs", start_services: bool = True, monitor: bool = False, pd_disagg: bool = False,
+                 multinode: bool = False, head_node_ip: str = None, head_node_role: str = None, worker_only: bool = False):
         self.test_type = test_type
         self.deployment = deployment
         self.start_services = start_services
         self.monitor = monitor
         self.pd_disagg = pd_disagg
+        self.multinode = multinode
+        self.head_node_ip = head_node_ip
+        self.head_node_role = head_node_role
+        self.worker_only = worker_only
         self.config = self._get_deployment_config()
-        self.service_manager = ServiceManager(config_dir, pd_disagg) if start_services else None
+        self.service_manager = ServiceManager(config_dir, pd_disagg, multinode, head_node_ip, head_node_role, worker_only) if start_services else None
         self.system_monitor = None
         
     def _get_deployment_config(self) -> Dict[str, Any]:
@@ -528,6 +604,16 @@ def main():
     parser.add_argument("--pd-disagg", action="store_true", default=False,
                        help="Use PD disaggregated architecture with scaling support (GPUs 0-3 for high SLO, 4-7 for low SLO)")
     
+    # Multinode arguments
+    parser.add_argument("--multinode", action="store_true", default=False,
+                       help="Enable multinode deployment mode")
+    parser.add_argument("--head-node-ip", type=str, default=None,
+                       help="IP address of the head node (required for multinode)")
+    parser.add_argument("--head-node-role", type=str, default=None,
+                       help="Role of the current node (head_and_high_slo, low_slo, etc.)")
+    parser.add_argument("--worker-only", action="store_true", default=False,
+                       help="Only start worker pools, not infrastructure services")
+    
     args = parser.parse_args()
     
     # Setup signal handler for cleanup
@@ -545,7 +631,11 @@ def main():
         config_dir=args.config_dir,
         start_services=not args.no_start_services,
         monitor=args.monitor,
-        pd_disagg=args.pd_disagg
+        pd_disagg=args.pd_disagg,
+        multinode=args.multinode,
+        head_node_ip=args.head_node_ip,
+        head_node_role=args.head_node_role,
+        worker_only=args.worker_only
     )
     
     success = asyncio.run(runner.run_complete_test())
