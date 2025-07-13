@@ -6,6 +6,7 @@ Common:
   model: Qwen/Qwen2.5-3B-Instruct
   block-size: 64
   max-model-len: 4096
+  router: kv-load
 
 Frontend:
   served_model_name: Qwen/Qwen2.5-3B-Instruct
@@ -13,6 +14,13 @@ Frontend:
   port: 8000
   router: round-robin
   common-configs: [block-size]
+
+Processor:
+  common-configs: [model, block-size, router]
+
+Router:
+  min-workers: 1
+  common-configs: [model, block-size, router]
 
 VllmWorker:
   enforce-eager: true

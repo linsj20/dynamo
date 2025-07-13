@@ -128,7 +128,17 @@ class ServiceManager:
         try:
             log_file = os.path.join(self.logs_dir, 'etcd.log')
             with open(log_file, 'w') as f:
-                process = subprocess.Popen(['etcd'], stdout=f, stderr=subprocess.STDOUT)
+                # Configure etcd to listen on all interfaces for multinode, localhost for single node
+                if self.multinode and self.head_node_ip:
+                    etcd_cmd = [
+                        'etcd',
+                        '--listen-client-urls', 'http://0.0.0.0:2379',
+                        '--advertise-client-urls', f'http://{self.head_node_ip}:2379'
+                    ]
+                else:
+                    etcd_cmd = ['etcd']  # Use defaults for localhost
+                    
+                process = subprocess.Popen(etcd_cmd, stdout=f, stderr=subprocess.STDOUT)
                 
             self.processes['etcd'] = process
             logger.info(f"etcd started (PID: {process.pid})")
@@ -149,12 +159,17 @@ class ServiceManager:
             return False
     
     def _start_nats(self) -> bool:
-        """Start NATS with JetStream"""
+        """Start NATS service"""
         try:
             log_file = os.path.join(self.logs_dir, 'nats.log')
             with open(log_file, 'w') as f:
-                # Start NATS with JetStream enabled (-js flag) and monitoring port (-m 8222)
-                process = subprocess.Popen(['nats-server', '-js', '-m', '8222'], 
+                # Configure NATS to listen on all interfaces for multinode, default for single node
+                if self.multinode and self.head_node_ip:
+                    nats_cmd = ['nats-server', '-js', '-m', '8222', '-a', '0.0.0.0']
+                else:
+                    nats_cmd = ['nats-server', '-js', '-m', '8222']
+                    
+                process = subprocess.Popen(nats_cmd,
                                          stdout=f, stderr=subprocess.STDOUT)
                 
             self.processes['nats'] = process
