@@ -56,7 +56,8 @@ class VllmWorker:
         self._prefill_queue_nats_server = os.getenv(
             "NATS_SERVER", "nats://localhost:4222"
         )
-        self.namespace, _ = VllmWorker.dynamo_address()  # type: ignore
+        # Use dynamo_context["namespace"] to get the actual runtime namespace, not the hardcoded one
+        self.namespace = dynamo_context["namespace"]
         self._prefill_queue_stream_name = f"{self.namespace}_prefill_queue"
         logger.info(
             f"Prefill queue: {self._prefill_queue_nats_server}:{self._prefill_queue_stream_name}"

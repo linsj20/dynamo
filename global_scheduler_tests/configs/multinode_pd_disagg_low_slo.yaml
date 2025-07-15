@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Multinode PD Disaggregated Low SLO Configuration - Optimized for throughput
-# Uses all 4 GPUs on the node, starts with 0 GPUs (planner auto-launches), can scale to 4 GPUs
+# Uses all 8 GPUs on the node, starts with 0 GPUs (planner auto-launches), can scale to 8 GPUs
 # This configuration is used for the low SLO pool in multinode deployment
 Common:
   model: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
@@ -10,7 +10,7 @@ Common:
   max-model-len: 4096
   kv-transfer-config: '{"kv_connector":"DynamoNixlConnector"}'
   router: kv-load
-  gpu-scope: "0,1,2,3"  # GPU scope for this pool (all 4 GPUs)
+  gpu-scope: "0,1,2,3,4,5,6,7"  # GPU scope for this pool (all 8 GPUs)
 
 Frontend:
   served_model_name: deepseek-ai/DeepSeek-R1-Distill-Llama-8B-low-slo
@@ -57,7 +57,7 @@ Planner:
   metric-pulling-interval: 1
   adjustment-interval: 10
   prefill-queue-scale-down-threshold: 0.1
-  prefill-queue-scale-up-threshold: 0.3   # Scale up prefill when queue size > 0.3
+  prefill-queue-scale-up-threshold: 0.2   # Scale up prefill when queue size > 0.3
   decode-kv-scale-down-threshold: 0.1
-  decode-kv-scale-up-threshold: 0.3     # Scale up decode when KV utilization > 30%
+  decode-kv-scale-up-threshold: 0.2     # Scale up decode when KV utilization > 30%
   log-dir: logs/planner_low_slo_multinode 

@@ -55,7 +55,7 @@ Planner:
   metric-pulling-interval: 1
   adjustment-interval: 10
   prefill-queue-scale-down-threshold: 0.1
-  prefill-queue-scale-up-threshold: 0.3   # Scale up prefill when queue size > 0.3
+  prefill-queue-scale-up-threshold: 0.2   # Scale up prefill when queue size > 0.3
   decode-kv-scale-down-threshold: 0.1
-  decode-kv-scale-up-threshold: 0.3     # Scale up decode when KV utilization > 30%
+  decode-kv-scale-up-threshold: 0.2     # Scale up decode when KV utilization > 30%
   log-dir: logs/planner_low_slo_multinode 

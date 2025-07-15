@@ -2,8 +2,22 @@
 """
 Global Scheduler Test Runner
 
-This script provides a complete test framework for the Global Scheduler system.
+This script provides a complete test framework for the Global Scheduler system with PD disaggregated architecture.
 It starts all required services, runs tests, and cleans up automatically.
+
+USAGE:
+  Single-node execution:
+    python runner.py --monitor
+    python runner.py --test-type simple --monitor
+    python runner.py --test-type scaling --monitor
+  
+  Multi-node execution:
+    python runner.py --multinode --head-node-ip <IP> --head-node-role head_and_high_slo
+    python runner.py --multinode --head-node-ip <IP> --head-node-role low_slo --worker-only
+  
+  SLURM execution (recommended):
+    sbatch --nodes=1 slurm_scripts/multinode_test_simple.sbatch  # Single-node
+    sbatch --nodes=2 slurm_scripts/multinode_test_simple.sbatch  # Multi-node
 """
 
 import argparse
@@ -38,13 +52,11 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
 
 class ServiceManager:
-    """Manages the lifecycle of services needed for Global Scheduler testing"""
+    """Manages the lifecycle of services needed for Global Scheduler testing with PD disaggregated architecture"""
     
-    def __init__(self, config_dir: str = "configs", pd_disagg: bool = False, 
-                 multinode: bool = False, head_node_ip: str = None, 
-                 head_node_role: str = None, worker_only: bool = False):
+    def __init__(self, config_dir: str = "configs", multinode: bool = False, 
+                 head_node_ip: str = None, head_node_role: str = None, worker_only: bool = False):
         self.config_dir = config_dir
-        self.pd_disagg = pd_disagg
         self.multinode = multinode
         self.head_node_ip = head_node_ip
         self.head_node_role = head_node_role
@@ -55,10 +67,9 @@ class ServiceManager:
         # Port counter for dynamic port allocation (multi-node safe)
         self.next_dynamo_port = 4000
         
-        # GPU allocation for PD disaggregated mode
-        # High SLO pool: GPUs 0-3, Low SLO pool: GPUs 4-7
-        self.high_slo_gpus = [0, 1, 2, 3]
-        self.low_slo_gpus = [4, 5, 6, 7]
+        # GPU allocation for PD disaggregated architecture is defined in configuration files
+        # Single-node: High SLO (0-3), Low SLO (4-7) 
+        # Multinode: Both pools (0-7) on separate nodes
         
         # Setup paths
         self._setup_environment()
@@ -96,12 +107,18 @@ class ServiceManager:
     def start_all_services(self) -> bool:
         """Start all required services for testing"""
         if self.multinode:
-            logger.info(f"Starting multinode services for Global Scheduler testing...")
+            logger.info(f"Starting multinode services for Global Scheduler testing with PD disaggregated architecture...")
             logger.info(f"Node role: {self.head_node_role}")
             logger.info(f"Head node IP: {self.head_node_ip}")
             logger.info(f"Worker only: {self.worker_only}")
         else:
-            logger.info("Starting all services for Global Scheduler testing...")
+            logger.info("Starting all services for Global Scheduler testing with PD disaggregated architecture...")
+        if self.multinode:
+            logger.info(f"GPU Allocation: Both pools have access to all GPUs (0-7) on their respective nodes")
+            logger.info(f"Each pool starts with 2 GPUs (1P+1D), can scale to 8 GPUs")
+        else:
+            logger.info(f"GPU Allocation: High SLO (0-3), Low SLO (4-7)")
+            logger.info(f"Each pool starts with 2 GPUs (1P+1D), can scale to 4 GPUs")
         logger.info(f"Logs will be written to: {self.logs_dir}/")
         
         if self.multinode and self.worker_only:
@@ -182,16 +199,15 @@ class ServiceManager:
             else:
                 logger.warning(f"  WARNING: Could not clear model deployment cards: {mdc_cleanup_result.stderr.decode()}")
                 
-            # Also clear disaggregation router configurations if running PD disaggregated tests
-            if self.pd_disagg:
-                disagg_cleanup_result = subprocess.run(
-                    ['etcdctl', 'del', '--prefix', 'public/components/disagg_router/'], 
-                    capture_output=True, timeout=10
-                )
-                if disagg_cleanup_result.returncode == 0:
-                    logger.info("  PASS: Cleared stale disaggregation router configurations")
-                else:
-                    logger.warning(f"  WARNING: Could not clear disaggregation router configurations: {disagg_cleanup_result.stderr.decode()}")
+            # Clear disaggregation router configurations
+            disagg_cleanup_result = subprocess.run(
+                ['etcdctl', 'del', '--prefix', 'public/components/disagg_router/'], 
+                capture_output=True, timeout=10
+            )
+            if disagg_cleanup_result.returncode == 0:
+                logger.info("  PASS: Cleared stale disaggregation router configurations")
+            else:
+                logger.warning(f"  WARNING: Could not clear disaggregation router configurations: {disagg_cleanup_result.stderr.decode()}")
                 
         except Exception as e:
             logger.error(f"FAIL: Failed to start etcd: {e} - check {log_file}")
@@ -253,249 +269,59 @@ class ServiceManager:
             return False
     
     def _start_pools(self) -> bool:
-        """Start SLO-based pools based on configuration"""
-        if self.pd_disagg:
-            if self.multinode:
-                return self._start_multinode_pd_disagg_pools()
-            else:
-                return self._start_local_pd_disagg_pools()
+        """Start SLO-based pools with PD disaggregated architecture"""
+        if self.multinode:
+            return self._start_multinode_pools()
         else:
-            if self.multinode:
-                # Log ETCD_ENDPOINTS from parent environment
-                logger.info(f"  Parent process ETCD_ENDPOINTS: {os.environ.get('ETCD_ENDPOINTS', 'NOT SET')}")
-                return self._start_multinode_pools()
-            else:
-                return self._start_local_pools()
+            return self._start_local_pools()
     
     def _start_local_pools(self) -> bool:
-        """Start the high and low SLO pools for single node deployment"""
-        logger.info("Starting SLO pools...")
+        """Start the high and low SLO pools for single node deployment with PD disaggregated architecture"""
+        logger.info("Starting SLO pools with PD disaggregated architecture...")
         
-        # Start high SLO pool with original single-GPU setup
-        if not self._start_pool('high', 8000, '0'):
+        # Start high SLO pool with PD disaggregated architecture
+        if not self._start_pool('high', 8000):
             return False
             
-        # Start low SLO pool with original single-GPU setup
-        if not self._start_pool('low', 8002, '1'):
+        # Start low SLO pool with PD disaggregated architecture  
+        if not self._start_pool('low', 8002):
             return False
             
         return True
     
     def _start_multinode_pools(self) -> bool:
-        """Start the high and low SLO pools for multinode deployment"""
-        logger.info("Starting SLO pools...")
+        """Start the high and low SLO pools for multinode deployment with PD disaggregated architecture"""
+        logger.info("Starting SLO pools with PD disaggregated architecture...")
         
-        # Multinode deployment - determine which pools to start based on node role
-        # Special case: if running in a container or testing, start both pools
+        # Determine which pools to start based on node role
         if os.getenv('DYNAMO_CONTAINER_MODE', 'false').lower() == 'true' or self.head_node_role == "all":
             logger.info("Container/testing mode detected - starting both SLO pools")
-            # Start both pools like in single node mode
-            if self.pd_disagg:
-                if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus, multinode=True):
-                    return False
-                if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus, multinode=True):
-                    return False
-            else:
-                if not self._start_pool('high', 8000, '0,1', multinode=True):
-                    return False
-                if not self._start_pool('low', 8002, '2,3', multinode=True):
-                    return False
+            # Start both pools
+            if not self._start_pool('high', 8000, multinode=True):
+                return False
+            if not self._start_pool('low', 8002, multinode=True):
+                return False
         elif self.head_node_role == "head_and_high_slo":
             # Head node runs high SLO pool only
-            if self.pd_disagg:
-                if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus, multinode=True):
-                    return False
-            else:
-                if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus, multinode=True):
-                    return False
+            if not self._start_pool('high', 8000, multinode=True):
+                return False
         elif self.head_node_role == "low_slo":
             # Worker node runs low SLO pool only
             # Add extra delay in multinode to ensure other node's services are ready
             logger.info("Waiting 10 seconds for other node's services to initialize...")
             time.sleep(10)
             
-            if self.pd_disagg:
-                if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus, multinode=True):
-                    return False
-            else:
-                if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus, multinode=True):
-                    return False
+            if not self._start_pool('low', 8002, multinode=True):
+                return False
         else:
             logger.error(f"Unknown node role: {self.head_node_role}")
             return False
         
         return True
     
-    def _start_local_pd_disagg_pools(self) -> bool:
-        """Start the high and low SLO pools for single node deployment with PD disaggregated architecture"""
-        logger.info("Starting SLO PD Disagg pools...")
-        
-        # Start high SLO pool with PD disaggregated architecture
-        if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus):
-            return False
-            
-        # Start low SLO pool with PD disaggregated architecture  
-        if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus):
-            return False
-            
-        return True
-    
-    def _start_multinode_pd_disagg_pools(self) -> bool:
-        """Start the high and low SLO pools for multinode deployment with PD disaggregated architecture"""
-        logger.info("Starting SLO PD Disagg pools...")
-        
-        # Multinode deployment - determine which pools to start based on node role
-        # Special case: if running in a container or testing, start both pools
-        if os.getenv('DYNAMO_CONTAINER_MODE', 'false').lower() == 'true' or self.head_node_role == "all":
-            logger.info("Container/testing mode detected - starting both SLO PD Disagg pools")
-            # Start both pools like in single node mode
-            if self.pd_disagg:
-                if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus, multinode=True):
-                    return False
-                if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus, multinode=True):
-                    return False
-            else:
-                if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus, multinode=True):
-                    return False
-                if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus, multinode=True):
-                    return False
-        elif self.head_node_role == "head_and_high_slo":
-            # Head node runs high SLO pool only
-            if self.pd_disagg:
-                if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus, multinode=True):
-                    return False
-            else:
-                if not self._start_pd_disagg_pool('high', 8000, self.high_slo_gpus, multinode=True):
-                    return False
-        elif self.head_node_role == "low_slo":
-            # Worker node runs low SLO pool only
-            if self.pd_disagg:
-                if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus, multinode=True):
-                    return False
-            else:
-                if not self._start_pd_disagg_pool('low', 8002, self.low_slo_gpus, multinode=True):
-                    return False
-        else:
-            logger.error(f"Unknown node role: {self.head_node_role}")
-            return False
-        
-        return True
-    
-    def _start_pool(self, slo_level: str, port: int, gpu: str, multinode: bool = False) -> bool:
-        """Start a specific SLO pool"""
-        log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pool.log')
-        
-        try:
-            # Choose configuration file based on multinode deployment
-            if multinode:
-                config_file = os.path.join(self.config_dir, f'multinode_simple_{slo_level}_slo.yaml')
-            else:
-                config_file = os.path.join(self.config_dir, f'simple_{slo_level}_slo.yaml')
-                
-            if not os.path.exists(config_file):
-                logger.error(f"FAIL: Config file not found: {config_file}")
-                return False
-            
-            # Make config file path absolute to work from any directory
-            config_file = os.path.abspath(config_file)
-                
-            # Get next available DYNAMO_PORT using counter
-            dynamo_port = self._get_next_dynamo_port()
-            
-            logger.info(f"  Starting {slo_level.upper()} SLO pool on GPU {gpu}, HTTP port {port}, FastAPI port {dynamo_port} (log: {log_file})")
-            
-            # Set environment for this pool
-            env = os.environ.copy()
-            
-            # For multinode, use actual hostname so global scheduler can reach the pool
-            import socket
-            pool_host = socket.gethostname() if multinode else 'localhost'
-            
-            # Ensure ETCD_ENDPOINTS is preserved from parent environment
-            etcd_endpoints = os.environ.get('ETCD_ENDPOINTS')
-            if etcd_endpoints:
-                env['ETCD_ENDPOINTS'] = etcd_endpoints
-            
-            env.update({
-                'CUDA_VISIBLE_DEVICES': gpu,
-                'DYN_DISABLE_AUTO_GPU_ALLOCATION': '1',
-                'DYNAMO_PORT': str(dynamo_port),  # Use dynamic port counter
-                'GLOBAL_SCHEDULER_HOST': self.head_node_ip if multinode else 'localhost',
-                'GLOBAL_SCHEDULER_PORT': '3999',
-                'POOL_HOST': pool_host
-            })
-            
-            # Log ETCD_ENDPOINTS for debugging
-            if multinode:
-                logger.info(f"    ETCD_ENDPOINTS from environment: {env.get('ETCD_ENDPOINTS', 'NOT SET')}")
-                
-                # Add UCX/NIXL optimization for multinode
-                # UCX settings for better multinode performance
-                env['UCX_NET_DEVICES'] = 'all'  # Use all available network devices
-                env['UCX_TLS'] = 'tcp,cuda_copy,cuda_ipc'  # Transport layers
-                env['UCX_LOG_LEVEL'] = 'info'  # Enable UCX logging for debugging
-                
-                # Increase timeouts for multinode network operations
-                env['UCX_RC_TIMEOUT'] = '10s'  # Increase RC timeout
-                env['UCX_UD_TIMEOUT'] = '10s'  # Increase UD timeout
-            
-            logger.info(f"    Pool will register with base URL: http://{pool_host}:{port}")
-            
-            # Change to examples/llm directory
-            llm_dir = os.path.join(self.project_root, 'examples', 'llm')
-            
-            # For multinode, we need to adjust the namespace, but for local mode we preserve the config file settings
-            cmd_args = [
-                'dynamo', 'serve', 'graphs.disagg_router:Frontend',
-                '-f', config_file,
-                f'--Frontend.port={port}'
-            ]
-            
-            # Only override namespace for multinode deployment
-            if multinode:
-                namespace_suffix = "_multinode"
-                namespace = f"{slo_level}_slo{namespace_suffix}"
-                cmd_args.extend([
-                    f'--Frontend.ServiceArgs.dynamo.namespace={namespace}',
-                    f'--Processor.ServiceArgs.dynamo.namespace={namespace}',
-                    f'--Router.ServiceArgs.dynamo.namespace={namespace}',
-                    f'--VllmWorker.ServiceArgs.dynamo.namespace={namespace}',
-                    f'--PrefillWorker.ServiceArgs.dynamo.namespace={namespace}',
-                    f'--Planner.ServiceArgs.dynamo.namespace={namespace}'
-                ])
-            
-            with open(log_file, 'w') as f:
-                process = subprocess.Popen(cmd_args, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
-                
-            self.processes[f'{slo_level}_pool'] = process
-            
-            # Wait for startup
-            time.sleep(10)
-            
-            if process.poll() is None:
-                logger.info(f"    PASS: {slo_level.upper()} SLO pool is running (PID: {process.pid})")
-                return True
-            else:
-                logger.error(f"    FAIL: {slo_level.upper()} SLO pool failed to start - check {log_file}")
-                # Show the last few lines of the log for quick debugging
-                try:
-                    with open(log_file, 'r') as f:
-                        lines = f.readlines()
-                        if lines:
-                            logger.error(f"    Last few lines from {log_file}:")
-                            for line in lines[-5:]:
-                                logger.error(f"      {line.strip()}")
-                except:
-                    pass
-                return False
-                
-        except Exception as e:
-            logger.error(f"FAIL: Failed to start {slo_level} SLO pool: {e} - check {log_file}")
-            return False
-    
-    def _start_pd_disagg_pool(self, slo_level: str, port: int, gpu_list: list, multinode: bool = False) -> bool:
+    def _start_pool(self, slo_level: str, port: int, multinode: bool = False) -> bool:
         """Start a specific SLO pool with PD disaggregated architecture"""
-        log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pd_disagg_pool.log')
+        log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pool.log')
         
         try:
             # Choose configuration file based on multinode deployment
@@ -514,7 +340,7 @@ class ServiceManager:
             # Get next available DYNAMO_PORT using counter
             dynamo_port = self._get_next_dynamo_port()
             
-            logger.info(f"  Starting {slo_level.upper()} SLO PD Disagg pool:")
+            logger.info(f"  Starting {slo_level.upper()} SLO pool:")
             logger.info(f"    - GPU scope defined in config file")
             logger.info(f"    - HTTP port {port}, FastAPI port {dynamo_port}")
             logger.info(f"    - Starts with 1P+1D workers, can scale via planner")
@@ -545,28 +371,33 @@ class ServiceManager:
                 logger.info(f"    ETCD_ENDPOINTS from environment: {env.get('ETCD_ENDPOINTS', 'NOT SET')}")
                 
                 # Add UCX/NIXL optimization for multinode
-                # UCX settings for better multinode performance
-                env['UCX_NET_DEVICES'] = 'all'  # Use all available network devices
-                env['UCX_TLS'] = 'tcp,cuda_copy,cuda_ipc'  # Transport layers
-                env['UCX_LOG_LEVEL'] = 'info'  # Enable UCX logging for debugging
-                
-                # Increase timeouts for multinode network operations
-                env['UCX_RC_TIMEOUT'] = '10s'  # Increase RC timeout
-                env['UCX_UD_TIMEOUT'] = '10s'  # Increase UD timeout
+                env.update({
+                    'UCX_NET_DEVICES': 'all',  # Use all available network devices
+                    'UCX_TLS': 'tcp,cuda_copy,cuda_ipc',  # Transport layers
+                    'UCX_LOG_LEVEL': 'info',  # Enable UCX logging for debugging
+                    'UCX_SOCKADDR_TLS_PRIORITY': 'tcp',  # Ensure TCP is prioritized for cross-node
+                    'UCX_TCP_CM_REUSEADDR': 'y',  # Allow socket reuse for multi-node
+                    'UCX_TCP_NODELAY': 'y',  # Disable Nagle's algorithm for low latency
+                    'UCX_RC_TIMEOUT': '10s',  # Increase RC timeout
+                    'UCX_UD_TIMEOUT': '10s',  # Increase UD timeout
+                    'UCX_MAX_RNDV_RAILS': '1',  # Limit rendezvous rails for stability
+                    'UCX_IB_PKEY': 'default',  # Use default partition key for InfiniBand
+                    'UCX_MM_FIFO_SIZE': '1024',  # Increase FIFO size for better throughput
+                })
             
             logger.info(f"    Pool will register with base URL: http://{pool_host}:{port}")
             
             # Change to examples/llm directory
             llm_dir = os.path.join(self.project_root, 'examples', 'llm')
             
-            # For multinode, we need to adjust the namespace, but for local mode we preserve the config file settings
+            # Build command arguments
             cmd_args = [
                 'dynamo', 'serve', 'graphs.disagg_router:Frontend',
                 '-f', config_file,
                 f'--Frontend.port={port}'
             ]
             
-            # Only override namespace for multinode deployment
+            # Override namespace for multinode deployment
             if multinode:
                 namespace_suffix = "_multinode"
                 namespace = f"{slo_level}_slo_pd{namespace_suffix}"
@@ -582,7 +413,7 @@ class ServiceManager:
             with open(log_file, 'w') as f:
                 process = subprocess.Popen(cmd_args, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=llm_dir)
                 
-            self.processes[f'{slo_level}_pd_disagg_pool'] = process
+            self.processes[f'{slo_level}_pool'] = process
             
             # Wait for startup (longer for disaggregated setup)
             startup_wait = 15
@@ -596,10 +427,10 @@ class ServiceManager:
             time.sleep(startup_wait)
             
             if process.poll() is None:
-                logger.info(f"    PASS: {slo_level.upper()} SLO PD Disagg pool is running (PID: {process.pid})")
+                logger.info(f"    PASS: {slo_level.upper()} SLO pool is running (PID: {process.pid})")
                 return True
             else:
-                logger.error(f"    FAIL: {slo_level.upper()} SLO PD Disagg pool failed to start - check {log_file}")
+                logger.error(f"    FAIL: {slo_level.upper()} SLO pool failed to start - check {log_file}")
                 # Show the last few lines of the log for quick debugging
                 try:
                     with open(log_file, 'r') as f:
@@ -613,7 +444,7 @@ class ServiceManager:
                 return False
                 
         except Exception as e:
-            logger.error(f"FAIL: Failed to start {slo_level} SLO PD Disagg pool: {e} - check {log_file}")
+            logger.error(f"FAIL: Failed to start {slo_level} SLO pool: {e} - check {log_file}")
             return False
     
     def stop_all(self):
@@ -647,19 +478,18 @@ class TestRunner:
     """Main test runner that orchestrates the complete test lifecycle"""
     
     def __init__(self, test_type: str = "simple", deployment: str = "local", 
-                 config_dir: str = "configs", start_services: bool = True, monitor: bool = False, pd_disagg: bool = False,
+                 config_dir: str = "configs", start_services: bool = True, monitor: bool = False,
                  multinode: bool = False, head_node_ip: str = None, head_node_role: str = None, worker_only: bool = False):
         self.test_type = test_type
         self.deployment = deployment
         self.start_services = start_services
         self.monitor = monitor
-        self.pd_disagg = pd_disagg
         self.multinode = multinode
         self.head_node_ip = head_node_ip
         self.head_node_role = head_node_role
         self.worker_only = worker_only
         self.config = self._get_deployment_config()
-        self.service_manager = ServiceManager(config_dir, pd_disagg, multinode, head_node_ip, head_node_role, worker_only) if start_services else None
+        self.service_manager = ServiceManager(config_dir, multinode, head_node_ip, head_node_role, worker_only) if start_services else None
         self.system_monitor = None
         
     def _get_deployment_config(self) -> Dict[str, Any]:
@@ -694,8 +524,11 @@ class TestRunner:
         logger.info(f"Deployment: {self.deployment}")
         logger.info(f"Start Services: {self.start_services}")
         logger.info(f"Monitor: {self.monitor}")
-        logger.info(f"PD Disaggregated: {self.pd_disagg}")
-        if self.pd_disagg:
+        logger.info(f"Architecture: PD Disaggregated (always enabled)")
+        if self.multinode:
+            logger.info(f"GPU Allocation: Both pools have access to all GPUs (0-7) on their respective nodes")
+            logger.info(f"Each pool starts with 2 GPUs (1P+1D), can scale to 8 GPUs")
+        else:
             logger.info(f"GPU Allocation: High SLO (0-3), Low SLO (4-7)")
             logger.info(f"Each pool starts with 2 GPUs (1P+1D), can scale to 4 GPUs")
         logger.info("=" * 60)
@@ -714,12 +547,9 @@ class TestRunner:
                     return False
                 
                 # Wait for services to be fully ready
-                if self.multinode:
-                    logger.info("Waiting for services to initialize (120 seconds)...")
-                    time.sleep(120)
-                else:
-                    logger.info("Waiting for services to initialize (90 seconds)...")
-                    time.sleep(90)
+                logger.info("Waiting for services to initialize (180 seconds)...")
+                time.sleep(180)
+            
             # Start monitoring if requested
             if self.monitor:
                 pool_urls = {
@@ -734,10 +564,16 @@ class TestRunner:
             # Only run tests on the head node (not on worker-only nodes)
             if self.worker_only:
                 logger.info("Worker node - skipping test execution, keeping services running")
-                # Keep the worker node running to serve requests
-                while True:
-                    await asyncio.sleep(60)
-                    # Could add health checks here if needed
+                # Keep the worker node running to serve requests until killed by head node
+                try:
+                    while True:
+                        await asyncio.sleep(60)
+                        # Could add health checks here if needed
+                except KeyboardInterrupt:
+                    logger.info("Worker node interrupted, shutting down...")
+                
+                logger.info("Worker node shutting down...")
+                return True  # Successful shutdown
             else:
                 # Run the actual tests only on the head node
                 logger.info("Head node - executing test logic")
@@ -821,7 +657,7 @@ class TestRunner:
         
 def main():
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Global Scheduler Complete Test Runner")
+    parser = argparse.ArgumentParser(description="Global Scheduler Test Runner with PD Disaggregated Architecture")
     parser.add_argument("--test-type", choices=["simple", "scaling"], default="simple",
                        help="Type of test to run (default: simple)")
     parser.add_argument("--deployment", choices=["local", "cluster", "custom"], default="local",
@@ -832,8 +668,6 @@ def main():
                        help="Skip starting services (assume they're already running)")
     parser.add_argument("--monitor", action="store_true", default=False,
                        help="Enable lightweight online monitoring of GPU utilization and pool load (default: false)")
-    parser.add_argument("--pd-disagg", action="store_true", default=False,
-                       help="Use PD disaggregated architecture with scaling support (GPUs 0-3 for high SLO, 4-7 for low SLO)")
     
     # Multinode arguments
     parser.add_argument("--multinode", action="store_true", default=False,
@@ -863,7 +697,6 @@ def main():
         config_dir=args.config_dir,
         start_services=not args.no_start_services,
         monitor=args.monitor,
-        pd_disagg=args.pd_disagg,
         multinode=args.multinode,
         head_node_ip=args.head_node_ip,
         head_node_role=args.head_node_role,

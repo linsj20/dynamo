@@ -63,8 +63,22 @@ class GlobalScheduler:
         
         logger.info("Global Scheduler starting...")
         
-        # Create HTTP session for pool communication
-        self.http_session = aiohttp.ClientSession()
+        # Create HTTP session for pool communication with connection isolation
+        connector = aiohttp.TCPConnector(
+            limit=100,  # Total connection pool size
+            limit_per_host=10,  # Max connections per host
+            ttl_dns_cache=300,  # DNS cache TTL
+            use_dns_cache=True,  # Enable DNS caching
+            keepalive_timeout=30,  # Connection keepalive
+            enable_cleanup_closed=True,  # Clean up closed connections
+            force_close=False,  # Don't force close connections
+        )
+        
+        self.http_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers={'User-Agent': 'GlobalScheduler/1.0'}
+        )
         
         logger.info("Global Scheduler initialized - waiting for pool registrations...")
 
@@ -259,7 +273,9 @@ class GlobalScheduler:
             }
             return
         
+        # CRITICAL: Add comprehensive logging to debug routing issues
         logger.info(f"Routing {request_id} to {pool_config.pool_id}")
+        logger.info(f"DEBUG: Pool config - ID: {pool_config.pool_id}, SLO: {pool_config.slo_level.value}, URL: {pool_config.base_url}")
         
         # Prepare the request payload for the pool's chat/completions endpoint
         chat_request = {
@@ -278,25 +294,42 @@ class GlobalScheduler:
         # Make HTTP request to pool's Frontend service
         url = f"{pool_config.base_url}/v1/chat/completions"
         
-        async with self.http_session.post(url, json=chat_request, timeout=30) as response:
-            if not response.status == 200:
-                error_text = await response.text()
-                yield {
-                    "success": False,
-                    "error": f"Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}",
-                    "assigned_pool": pool_config.pool_id
-                }
-                return
-            
-            response_data = await response.json()
-            
-            # Yield the complete response
+        # CRITICAL: Add pre-request logging to verify URL
+        logger.info(f"DEBUG: Making HTTP request to URL: {url}")
+        logger.info(f"DEBUG: Request ID: {request_id}, Pool: {pool_config.pool_id}")
+        
+        try:
+            # Use the existing HTTP session for stable connections
+            async with self.http_session.post(url, json=chat_request) as response:
+                    logger.info(f"DEBUG: Received response from {url} with status {response.status}")
+                    
+                    if not response.status == 200:
+                        error_text = await response.text()
+                        logger.error(f"ERROR: Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}")
+                        yield {
+                            "success": False,
+                            "error": f"Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}",
+                            "assigned_pool": pool_config.pool_id
+                        }
+                        return
+                    
+                    response_data = await response.json()
+                    
+                    # Yield the complete response
+                    yield {
+                        "success": True,
+                        "assigned_pool": pool_config.pool_id,
+                        "pool_url": pool_config.base_url,
+                        "model_used": pool_config.model_name,
+                        "response": response_data
+                    }
+                    
+        except Exception as e:
+            logger.error(f"ERROR: HTTP request to {url} failed: {e}")
             yield {
-                "success": True,
-                "assigned_pool": pool_config.pool_id,
-                "pool_url": pool_config.base_url,
-                "model_used": pool_config.model_name,
-                "response": response_data
+                "success": False,
+                "error": f"HTTP request to pool {pool_config.pool_id} failed: {e}",
+                "assigned_pool": pool_config.pool_id
             }
     
     @endpoint()
@@ -346,12 +379,17 @@ class GlobalScheduler:
         Returns:
             Pool configuration if available, None if no suitable pool found
         """
+        # DEBUG: Log current pool state
+        logger.info(f"DEBUG: Looking for pool with SLO level: {slo_level.value}")
+        logger.info(f"DEBUG: Available pools: {[(p.pool_id, p.slo_level.value, p.base_url) for p in self.pools.values()]}")
+        
         # Filter pools by SLO level
         matching_pools = [pool for pool in self.pools.values() if pool.slo_level == slo_level]
         
         if matching_pools:
-            # Return the first matching pool (could be enhanced with load balancing)
-            return matching_pools[0]
+            selected_pool = matching_pools[0]
+            logger.info(f"DEBUG: Selected pool: {selected_pool.pool_id} (SLO: {selected_pool.slo_level.value}, URL: {selected_pool.base_url})")
+            return selected_pool
         
         # Fallback: if no exact match, try to find a higher SLO level pool
         if slo_level == SLOLevel.LOW:
@@ -367,8 +405,11 @@ class GlobalScheduler:
             fallback_pools = []
         
         if fallback_pools:
-            return fallback_pools[0]
+            selected_pool = fallback_pools[0]
+            logger.info(f"DEBUG: Using fallback pool: {selected_pool.pool_id} (SLO: {selected_pool.slo_level.value}, URL: {selected_pool.base_url})")
+            return selected_pool
         
+        logger.warning(f"DEBUG: No suitable pool found for SLO level: {slo_level.value}")
         return None
 
     async def cleanup(self):
@@ -380,4 +421,4 @@ class GlobalScheduler:
             await self.http_session.close()
             self.http_session = None
         
-        logger.info("Global Scheduler cleanup complete") 
+        logger.info("Global Scheduler cleanup complete")
