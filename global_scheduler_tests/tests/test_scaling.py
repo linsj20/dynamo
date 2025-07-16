@@ -28,19 +28,19 @@ class ScalingTest(BaseGlobalSchedulerTest):
         self.phase_results = {}  # Track results by load phase
         
     def _generate_random_prefix(self) -> str:
-        """Generate a random prefix to avoid KV cache reuse"""
-        # Generate 2-3 random words/tokens to make each request unique
-        word_count = random.randint(2, 4)
+        """Generate a long random prefix with spaces to avoid KV cache reuse"""
+        # Generate 8-15 random words/tokens to make each request unique with long prefix
+        word_count = random.randint(30, 100)
         prefixes = []
         
         for _ in range(word_count):
             # Mix of random words and numbers for variety
             if random.choice([True, False]):
-                # Random word (4-8 characters)
-                word = ''.join(random.choices(string.ascii_lowercase, k=random.randint(4, 8)))
+                # Random word (6-12 characters for longer words)
+                word = ''.join(random.choices(string.ascii_lowercase, k=random.randint(6, 12)))
             else:
-                # Random number (2-4 digits)
-                word = str(random.randint(10, 9999))
+                # Random number (3-6 digits for longer numbers)
+                word = str(random.randint(100, 999999))
             prefixes.append(word)
         
         return f"[{' '.join(prefixes)}] "
@@ -180,7 +180,7 @@ class ScalingTest(BaseGlobalSchedulerTest):
             # Generate random prefix to avoid KV cache reuse
             random_prefix = self._generate_random_prefix()
             base_prompt = prompts[request_counter % len(prompts)]
-            unique_prompt = f"{random_prefix}{base_prompt}"
+            unique_prompt = f"{random_prefix} {base_prompt}"
             
             request = TestRequest(
                 request_id=f"{phase_name}_{request_counter}",

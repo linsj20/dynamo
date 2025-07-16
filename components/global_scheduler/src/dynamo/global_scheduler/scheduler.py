@@ -53,6 +53,12 @@ class GlobalScheduler:
         self.http_session: Optional[aiohttp.ClientSession] = None
         self._shutdown_event = asyncio.Event()
         
+        # HTTP connection pool configuration (configurable via environment variables)
+        # Set to 0 for unlimited connections
+        # WARNING: Unlimited connections can lead to resource exhaustion under extreme load
+        self.connection_pool_limit = int(os.getenv("GLOBAL_SCHEDULER_CONNECTION_LIMIT", "0"))
+        self.connection_per_host_limit = int(os.getenv("GLOBAL_SCHEDULER_CONNECTION_PER_HOST_LIMIT", "0"))
+        
         logger.info("Global Scheduler initialized")
 
     @async_on_start
@@ -63,10 +69,20 @@ class GlobalScheduler:
         
         logger.info("Global Scheduler starting...")
         
+        # Log connection limits (0 means unlimited)
+        total_limit_str = "unlimited" if self.connection_pool_limit == 0 else str(self.connection_pool_limit)
+        per_host_limit_str = "unlimited" if self.connection_per_host_limit == 0 else str(self.connection_per_host_limit)
+        logger.info(f"HTTP connection pool configuration: total_limit={total_limit_str}, per_host_limit={per_host_limit_str}")
+        
+        # Warn about unlimited connections
+        if self.connection_pool_limit == 0 or self.connection_per_host_limit == 0:
+            logger.warning("WARNING: Unlimited HTTP connections enabled. Monitor resource usage to prevent exhaustion.")
+        
         # Create HTTP session for pool communication with connection isolation
+        # Note: limit=0 means unlimited in aiohttp
         connector = aiohttp.TCPConnector(
-            limit=100,  # Total connection pool size
-            limit_per_host=10,  # Max connections per host
+            limit=self.connection_pool_limit,  # Total connection pool size (0 = unlimited)
+            limit_per_host=self.connection_per_host_limit,  # Max connections per host (0 = unlimited)
             ttl_dns_cache=300,  # DNS cache TTL
             use_dns_cache=True,  # Enable DNS caching
             keepalive_timeout=30,  # Connection keepalive
