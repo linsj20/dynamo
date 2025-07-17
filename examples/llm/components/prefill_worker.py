@@ -85,7 +85,9 @@ class PrefillWorker:
             raise RuntimeError("Failed to initialize engine client")
         runtime = dynamo_context["runtime"]
         metadata = self.engine_client.nixl_metadata
-        self._metadata_store = NixlMetadataStore("dynamo", runtime)
+        # Use dynamic namespace instead of hardcoded "dynamo"
+        namespace = dynamo_context["namespace"]
+        self._metadata_store = NixlMetadataStore(namespace, runtime)
         await self._metadata_store.put(metadata.engine_id, metadata)
         self.task = asyncio.create_task(self.prefill_queue_handler())
 

@@ -113,12 +113,14 @@ class Watcher:
     @async_on_start
     async def async_init(self):
         self.runtime = dynamo_context["runtime"]
+        # Use dynamic namespace instead of hardcoded "dynamo"
+        current_namespace = dynamo_context["namespace"]
         self.workers_clients = []
         for component, endpoint in zip(
             self.args.worker_components, self.args.component_endpoints
         ):
             self.workers_clients.append(
-                await self.runtime.namespace("dynamo")
+                await self.runtime.namespace(current_namespace)
                 .component(component)
                 .endpoint(endpoint)
                 .client()

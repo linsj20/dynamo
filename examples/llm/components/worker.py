@@ -123,7 +123,8 @@ class VllmWorker:
 
         if self.engine_args.remote_prefill:
             metadata = self.engine_client.nixl_metadata
-            metadata_store = NixlMetadataStore("dynamo", runtime)
+            # Use dynamic namespace instead of hardcoded "dynamo"
+            metadata_store = NixlMetadataStore(self.namespace, runtime)
             await metadata_store.put(metadata.engine_id, metadata)
 
         if self.engine_args.conditional_disagg:

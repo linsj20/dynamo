@@ -356,26 +356,27 @@ class Planner:
             self.decode_worker_remaining_grace_period -= 1
 
     async def ensure_minimum_workers(self):
-        """Launch 1 prefill worker and 1 decode worker"""
-        logger.info("Launching 1 prefill worker and 1 decode worker...")
+        """Launch 1 prefill worker and 1 decode worker in parallel (non-blocking)"""
+        logger.info("Launching 1 prefill worker and 1 decode worker in parallel...")
         
-        # Launch 1 prefill worker
-        success = await self.connector.add_component("PrefillWorker", blocking=True)
-        if success:
-            logger.info("Successfully launched prefill worker")
+        # Launch both workers in parallel with non-blocking mode
+        # They will start immediately and register asynchronously as they become ready
+        prefill_success = await self.connector.add_component("PrefillWorker", blocking=False)
+        vllm_success = await self.connector.add_component("VllmWorker", blocking=False)
+        
+        if prefill_success:
+            logger.info("Successfully started prefill worker (will register asynchronously)")
         else:
-            logger.error("Failed to launch prefill worker")
+            logger.error("Failed to start prefill worker")
         
-        # Launch 1 decode worker
-        success = await self.connector.add_component("VllmWorker", blocking=True)
-        if success:
-            logger.info("Successfully launched decode worker")
+        if vllm_success:
+            logger.info("Successfully started decode worker (will register asynchronously)")
         else:
-            logger.error("Failed to launch decode worker")
+            logger.error("Failed to start decode worker")
         
-        # Log current state after launching workers
-        p_endpoints_final, d_endpoints_final = await self.get_workers_info()
-        logger.info(f"After launching workers: {len(p_endpoints_final)} prefill workers, {len(d_endpoints_final)} decode workers")
+        # Log current state - workers may not be registered yet, that's expected
+        logger.info("Both workers started, they will register as they become ready")
+        logger.info("Note: Workers are loading models in parallel and will register asynchronously")
 
     async def run(self):
         """Main loop for the planner"""
