@@ -68,7 +68,13 @@ class Planner:
             else:
                 logger.info(f"Using GPU scope from args: {gpu_scope}")
             
-            self.connector = LocalConnector(args.namespace, runtime, gpu_scope)
+            self.connector = LocalConnector(
+                args.namespace, 
+                runtime, 
+                gpu_scope, 
+                decode_engine_num_gpu=args.decode_engine_num_gpu,
+                prefill_engine_num_gpu=args.prefill_engine_num_gpu
+            )
         elif args.environment == "kubernetes":
             self.connector = KubernetesConnector(args.namespace)
         else:

@@ -13,11 +13,16 @@ USAGE:
   
   Multi-node execution:
     python runner.py --multinode --head-node-ip <IP> --head-node-role head_and_high_slo
-    python runner.py --multinode --head-node-ip <IP> --head-node-role low_slo --worker-only
+python runner.py --multinode --head-node-ip <IP> --head-node-role high_slo --worker-only
+python runner.py --multinode --head-node-ip <IP> --head-node-role low_slo --worker-only
   
   SLURM execution (recommended):
     sbatch --nodes=1 slurm_scripts/multinode_test_simple.sbatch  # Single-node
     sbatch --nodes=2 slurm_scripts/multinode_test_simple.sbatch  # Multi-node
+
+NOTE: In multinode deployments, log files are named with hostname suffixes to avoid conflicts:
+  - Single-node: high_slo_pool.log, low_slo_pool.log
+  - Multi-node: high_slo_pool_<hostname>.log, low_slo_pool_<hostname>.log
 """
 
 import argparse
@@ -28,7 +33,7 @@ import logging
 import time
 import signal
 import subprocess
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # Add paths for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'lib', 'bindings', 'python', 'src'))
@@ -55,7 +60,8 @@ class ServiceManager:
     """Manages the lifecycle of services needed for Global Scheduler testing with PD disaggregated architecture"""
     
     def __init__(self, config_dir: str = "configs", multinode: bool = False, 
-                 head_node_ip: str = None, head_node_role: str = None, worker_only: bool = False):
+                 head_node_ip: str = None, head_node_role: str = None, worker_only: bool = False,
+                 high_slo_nodes: int = None, low_slo_nodes: int = None):
         self.config_dir = config_dir
         self.multinode = multinode
         self.head_node_ip = head_node_ip
@@ -67,9 +73,13 @@ class ServiceManager:
         # Port counter for dynamic port allocation (multi-node safe)
         self.next_dynamo_port = 4000
         
-        # GPU allocation for PD disaggregated architecture is defined in configuration files
+        # Handle node count configuration with environment variable fallback
+        self.high_slo_nodes = high_slo_nodes or int(os.getenv('HIGH_SLO_NODE_COUNT', '2'))
+        self.low_slo_nodes = low_slo_nodes or int(os.getenv('LOW_SLO_NODE_COUNT', '1'))
+        
+        # GPU allocation for PD disaggregated architecture
         # Single-node: High SLO (0-3), Low SLO (4-7) 
-        # Multinode: Both pools (0-7) on separate nodes
+        # Multinode with dynamic node counts: High SLO (high_slo_nodes x 8 GPUs), Low SLO (low_slo_nodes x 8 GPUs)
         
         # Setup paths
         self._setup_environment()
@@ -305,6 +315,14 @@ class ServiceManager:
             # Head node runs high SLO pool only
             if not self._start_pool('high', 8000, multinode=True):
                 return False
+        elif self.head_node_role == "high_slo":
+            # Worker node runs high SLO pool only
+            # Add extra delay in multinode to ensure other node's services are ready
+            logger.info("Waiting 10 seconds for other node's services to initialize...")
+            time.sleep(10)
+            
+            if not self._start_pool('high', 8000, multinode=True):
+                return False
         elif self.head_node_role == "low_slo":
             # Worker node runs low SLO pool only
             # Add extra delay in multinode to ensure other node's services are ready
@@ -319,15 +337,29 @@ class ServiceManager:
         
         return True
     
+    def _get_pool_log_files(self) -> List[str]:
+        """Get list of all pool log files for debugging"""
+        import glob
+        log_pattern = os.path.join(self.logs_dir, '*_slo_pool*.log')
+        return glob.glob(log_pattern)
+    
     def _start_pool(self, slo_level: str, port: int, multinode: bool = False) -> bool:
         """Start a specific SLO pool with PD disaggregated architecture"""
-        log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pool.log')
+        if multinode:
+            # Include hostname in log file name to avoid conflicts between nodes
+            import socket
+            hostname = socket.gethostname()
+            log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pool_{hostname}.log')
+        else:
+            log_file = os.path.join(self.logs_dir, f'{slo_level}_slo_pool.log')
         
         try:
-            # Choose configuration file based on multinode deployment
+            # Choose configuration file based on deployment mode
             if multinode:
-                config_file = os.path.join(self.config_dir, f'multinode_pd_disagg_{slo_level}_slo.yaml')
+                # Use new tensor parallelism configs for multinode deployment
+                config_file = os.path.join(self.config_dir, f'{slo_level}_slo.yaml')
             else:
+                # Use original single-node config
                 config_file = os.path.join(self.config_dir, f'pd_disagg_{slo_level}_slo.yaml')
                 
             if not os.path.exists(config_file):
@@ -340,8 +372,25 @@ class ServiceManager:
             # Get next available DYNAMO_PORT using counter
             dynamo_port = self._get_next_dynamo_port()
             
+            # Calculate GPU allocation info for this pool
+            if multinode:
+                if slo_level == 'high':
+                    node_count = self.high_slo_nodes
+                    total_gpus = node_count * 8
+                    tp_size = 2
+                else:
+                    node_count = self.low_slo_nodes
+                    total_gpus = node_count * 8
+                    tp_size = 1
+            else:
+                node_count = 1
+                total_gpus = 4  # Single node uses 4 GPUs per pool
+                tp_size = 1
+            
             logger.info(f"  Starting {slo_level.upper()} SLO pool:")
-            logger.info(f"    - GPU scope defined in config file")
+            logger.info(f"    - Config file: {os.path.basename(config_file)}")
+            logger.info(f"    - Node count: {node_count}, Total GPUs: {total_gpus}")
+            logger.info(f"    - Tensor parallel size: {tp_size}")
             logger.info(f"    - HTTP port {port}, FastAPI port {dynamo_port}")
             logger.info(f"    - Starts with 1P+1D workers, can scale via planner")
             logger.info(f"    - Log: {log_file}")
@@ -479,7 +528,8 @@ class TestRunner:
     
     def __init__(self, test_type: str = "simple", deployment: str = "local", 
                  config_dir: str = "configs", start_services: bool = True, monitor: bool = False,
-                 multinode: bool = False, head_node_ip: str = None, head_node_role: str = None, worker_only: bool = False):
+                 multinode: bool = False, head_node_ip: str = None, head_node_role: str = None, worker_only: bool = False,
+                 high_slo_nodes: int = None, low_slo_nodes: int = None):
         self.test_type = test_type
         self.deployment = deployment
         self.start_services = start_services
@@ -488,8 +538,10 @@ class TestRunner:
         self.head_node_ip = head_node_ip
         self.head_node_role = head_node_role
         self.worker_only = worker_only
+        self.high_slo_nodes = high_slo_nodes
+        self.low_slo_nodes = low_slo_nodes
         self.config = self._get_deployment_config()
-        self.service_manager = ServiceManager(config_dir, multinode, head_node_ip, head_node_role, worker_only) if start_services else None
+        self.service_manager = ServiceManager(config_dir, multinode, head_node_ip, head_node_role, worker_only, high_slo_nodes, low_slo_nodes) if start_services else None
         self.system_monitor = None
         
     def _get_deployment_config(self) -> Dict[str, Any]:
@@ -542,8 +594,7 @@ class TestRunner:
                     logger.error(f"  - {self.service_manager.logs_dir}/etcd.log")
                     logger.error(f"  - {self.service_manager.logs_dir}/nats.log")
                     logger.error(f"  - {self.service_manager.logs_dir}/global_scheduler.log")
-                    logger.error(f"  - {self.service_manager.logs_dir}/high_slo_pool.log")
-                    logger.error(f"  - {self.service_manager.logs_dir}/low_slo_pool.log")
+                    logger.error(f"  - {self.service_manager.logs_dir}/*_slo_pool*.log (pool logs)")
                     return False
                 
                 # Wait for services to be fully ready
@@ -558,7 +609,21 @@ class TestRunner:
                 }
                 logs_dir = self.service_manager.logs_dir if self.service_manager else os.path.join(os.path.dirname(__file__), 'logs')
                 
-                self.system_monitor = SystemMonitor(pool_urls, logs_dir)
+                # Define GPU mapping for pool-specific monitoring
+                if self.multinode:
+                    # In multinode mode, each pool uses all GPUs (0-7) on its dedicated nodes
+                    pool_gpu_mapping = {
+                        'high_slo': list(range(8)),  # GPUs 0-7 on high SLO nodes
+                        'low_slo': list(range(8))    # GPUs 0-7 on low SLO nodes
+                    }
+                else:
+                    # In single-node mode, split GPUs between pools
+                    pool_gpu_mapping = {
+                        'high_slo': list(range(4)),  # GPUs 0-3
+                        'low_slo': list(range(4, 8))  # GPUs 4-7
+                    }
+                
+                self.system_monitor = SystemMonitor(pool_urls, logs_dir, pool_gpu_mapping=pool_gpu_mapping)
                 await self.system_monitor.start()
             
             # Only run tests on the head node (not on worker-only nodes)
@@ -675,12 +740,22 @@ def main():
     parser.add_argument("--head-node-ip", type=str, default=None,
                        help="IP address of the head node (required for multinode)")
     parser.add_argument("--head-node-role", type=str, default=None,
-                       choices=["head_and_high_slo", "low_slo", "all"],
-                       help="Role of the current node: head_and_high_slo (head node with high SLO pool), low_slo (worker node with low SLO pool), all (both pools for testing)")
+                       choices=["head_and_high_slo", "high_slo", "low_slo", "all"],
+                       help="Role of the current node: head_and_high_slo (head node with high SLO pool), high_slo (worker node with high SLO pool), low_slo (worker node with low SLO pool), all (both pools for testing)")
     parser.add_argument("--worker-only", action="store_true", default=False,
                        help="Only start worker pools, not infrastructure services")
     
+    # Pool node count arguments
+    parser.add_argument("--high-slo-nodes", type=int, default=None,
+                       help="Number of nodes for high SLO pool (env: HIGH_SLO_NODE_COUNT)")
+    parser.add_argument("--low-slo-nodes", type=int, default=None,
+                       help="Number of nodes for low SLO pool (env: LOW_SLO_NODE_COUNT)")
+    
     args = parser.parse_args()
+    
+    # Handle environment variable fallback for node counts
+    high_slo_nodes = args.high_slo_nodes or (int(os.getenv('HIGH_SLO_NODE_COUNT')) if os.getenv('HIGH_SLO_NODE_COUNT') else None)
+    low_slo_nodes = args.low_slo_nodes or (int(os.getenv('LOW_SLO_NODE_COUNT')) if os.getenv('LOW_SLO_NODE_COUNT') else None)
     
     # Setup signal handler for cleanup
     def signal_handler(signum, frame):
@@ -700,7 +775,9 @@ def main():
         multinode=args.multinode,
         head_node_ip=args.head_node_ip,
         head_node_role=args.head_node_role,
-        worker_only=args.worker_only
+        worker_only=args.worker_only,
+        high_slo_nodes=high_slo_nodes,
+        low_slo_nodes=low_slo_nodes
     )
     
     success = asyncio.run(runner.run_complete_test())

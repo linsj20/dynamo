@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 
 class LocalConnector(PlannerConnector):
-    def __init__(self, namespace: str, runtime: DistributedRuntime, gpu_scope: str = None):
+    def __init__(self, namespace: str, runtime: DistributedRuntime, gpu_scope: str = None, 
+                 decode_engine_num_gpu: int = 1, prefill_engine_num_gpu: int = 1):
         """
         Initialize LocalConnector and connect to CircusController.
 
@@ -40,10 +41,14 @@ class LocalConnector(PlannerConnector):
             namespace: The Dynamo namespace
             runtime: Optional DistributedRuntime instance
             gpu_scope: GPU scope string to limit available GPUs (e.g., "0,1,2,3" or "0-3")
+            decode_engine_num_gpu: Number of GPUs per decode worker (tensor parallelism)
+            prefill_engine_num_gpu: Number of GPUs per prefill worker (tensor parallelism)
         """
         self.namespace = namespace
         self.runtime = runtime
         self.gpu_scope = gpu_scope
+        self.decode_engine_num_gpu = decode_engine_num_gpu
+        self.prefill_engine_num_gpu = prefill_engine_num_gpu
         self.state_file = Path.home() / ".dynamo" / "state" / f"{namespace}.json"
         self.circus = CircusController.from_state_file(namespace)
         self._lockfile = self.state_file.with_suffix(".lock")
@@ -179,35 +184,40 @@ class LocalConnector(PlannerConnector):
 
         # Build environment
         watcher_env = os.environ.copy()
-        gpu_id = None
+        allocated_gpu_ids = []
         if component_name in ["VllmWorker", "PrefillWorker"]:
-            # Always use the GPU allocation logic to get individual GPUs
+            # Determine how many GPUs needed based on tensor parallelism config
+            gpus_needed = 1  # Default to 1 GPU
+            if component_name == "VllmWorker":
+                gpus_needed = self.decode_engine_num_gpu
+            elif component_name == "PrefillWorker":
+                gpus_needed = self.prefill_engine_num_gpu
+            
+            logger.info(f"Component {component_name} needs {gpus_needed} GPUs for tensor parallelism")
+            
             # Reload state to ensure we have the latest GPU allocations
             state = await self._load_state()
             available_gpus = await self._get_available_gpus()
-            if not available_gpus:
-                raise ValueError("No GPUs available for allocation")
-            gpu_id = available_gpus[0]
-            watcher_env["CUDA_VISIBLE_DEVICES"] = gpu_id
-            logger.info(f"Setting CUDA_VISIBLE_DEVICES to individual GPU: {gpu_id}")
+            if len(available_gpus) < gpus_needed:
+                raise ValueError(f"Need {gpus_needed} GPUs but only {len(available_gpus)} available")
             
-            # IMMEDIATELY mark GPU as allocated to prevent race conditions
-            # Add GPU to allocated_gpus list (should be empty for new workers)
+            # Allocate the required number of GPUs
+            allocated_gpu_ids = available_gpus[:gpus_needed]
+            cuda_visible_devices = ",".join(allocated_gpu_ids)
+            watcher_env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+            logger.info(f"Setting CUDA_VISIBLE_DEVICES to {gpus_needed} GPUs: {cuda_visible_devices}")
+            
+            # IMMEDIATELY mark GPUs as allocated to prevent race conditions
             existing_resources = state["components"].get(watcher_name, {}).get("resources", {})
-            allocated_gpus = existing_resources.get("allocated_gpus", [])
-            assert gpu_id not in allocated_gpus, f"GPU {gpu_id} already allocated"
-            allocated_gpus.append(gpu_id)
-            
-            resources = existing_resources.copy()
-            resources["allocated_gpus"] = allocated_gpus
+            existing_resources["allocated_gpus"] = allocated_gpu_ids
             
             state["components"][watcher_name] = {
                 "watcher_name": watcher_name,
                 "cmd": "pending",  # Will be updated after successful start
-                "resources": resources,
+                "resources": existing_resources,
             }
             await self._save_state(state)
-            logger.info(f"Pre-allocated GPU {gpu_id} for {watcher_name} (allocated_gpus: {allocated_gpus})")
+            logger.info(f"Pre-allocated {gpus_needed} GPUs {allocated_gpu_ids} for {watcher_name}")
 
         watcher_env["DYNAMO_SERVICE_CONFIG"] = service_config
 
@@ -244,7 +254,7 @@ class LocalConnector(PlannerConnector):
         else:
             # Worker failed to start, clean up GPU allocation
             if component_name in ["VllmWorker", "PrefillWorker"] and watcher_name in state["components"]:
-                logger.error(f"Worker {watcher_name} failed to start, releasing GPU {gpu_id}")
+                logger.error(f"Worker {watcher_name} failed to start, releasing GPUs {allocated_gpu_ids}")
                 del state["components"][watcher_name]
                 await self._save_state(state)
             raise RuntimeError(f"Failed to start watcher {watcher_name}")
@@ -266,7 +276,7 @@ class LocalConnector(PlannerConnector):
                 
             if retry_count >= max_retries:
                 # Worker failed to start within timeout, clean up GPU allocation
-                logger.error(f"Worker {watcher_name} failed to start within timeout, cleaning up GPU allocation")
+                logger.error(f"Worker {watcher_name} failed to start within timeout, cleaning up GPU allocation for GPUs {allocated_gpu_ids}")
                 if component_name in ["VllmWorker", "PrefillWorker"] and watcher_name in state["components"]:
                     del state["components"][watcher_name]
                     await self._save_state(state)

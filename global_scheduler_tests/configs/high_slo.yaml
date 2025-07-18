@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# High SLO Configuration with Tensor Parallelism - Optimized for <1s response time
+# Uses tensor-parallel-size: 2 for high SLO performance requirements
+# TESTING FOCUS: Verify that TP=2 is properly configured and used by vLLM
+Common:
+  model: deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+  block-size: 64
+  max-model-len: 4096
+  kv-transfer-config: '{"kv_connector":"DynamoNixlConnector"}'
+  router: kv-load
+  gpu-scope: "0,1,2,3,4,5,6,7"  # GPU scope for this pool (all 8 GPUs per node)
+
+Frontend:
+  served_model_name: deepseek-ai/DeepSeek-R1-Distill-Llama-8B-high-slo
+  endpoint: high_slo_pd_multinode.Processor.chat/completions
+  port: 8000
+  router: round-robin
+  common-configs: [block-size]
+
+Processor:
+  common-configs: [model, block-size, router]
+
+Router:
+  min-workers: 1
+  common-configs: [model, block-size, router]
+
+# Planner configuration for SLO-aware tensor parallelism (merged section below)
+
+# Decode workers - planner will auto-launch minimum required workers
+VllmWorker:
+  remote-prefill: true
+  conditional-disagg: false  # Always use remote prefill for consistent performance
+  max-num-batched-tokens: 4096
+  enable-prefix-caching: true
+  max-num-seqs: 32
+  gpu-memory-utilization: 0.85  # Reduce memory usage
+  tensor-parallel-size: 2
+  ServiceArgs:
+    workers: 0  # Planner will auto-launch minimum required workers
+    resources:
+      gpu: '2'   # 2 GPUs per decode worker for tensor parallelism
+  common-configs: [model, block-size, max-model-len, kv-transfer-config]
+
+# Prefill workers - planner will auto-launch minimum required workers
+PrefillWorker:
+  max-num-batched-tokens: 8192  # Higher batch size for prefill
+  gpu-memory-utilization: 0.85  # Reduce memory usage
+  tensor-parallel-size: 2
+  ServiceArgs:
+    workers: 0  # Planner will auto-launch minimum required workers
+    resources:
+      gpu: '2'   # 2 GPUs per prefill worker for tensor parallelism
+  common-configs: [model, block-size, max-model-len, kv-transfer-config]
+
+# Planner for automatic scaling with SLO-aware tensor parallelism
+Planner:
+  environment: local
+  no-operation: false
+  metric-pulling-interval: 1
+  adjustment-interval: 10
+  prefill-queue-scale-down-threshold: 0.1
+  prefill-queue-scale-up-threshold: 0.2   # Scale up prefill when queue size > 0.2
+  decode-kv-scale-down-threshold: 0.1
+  decode-kv-scale-up-threshold: 0.2     # Scale up decode when KV utilization > 20%
+  log-dir: logs/planner_high_slo_multinode
+  # SLO-aware tensor parallelism settings
+  slo-level: HIGH  # Uses TP=2 for high SLO performance
+  decode-engine-num-gpu: 2  # Number of GPUs per decode worker (tensor parallelism)
+  prefill-engine-num-gpu: 2  # Number of GPUs per prefill worker (tensor parallelism)

@@ -20,21 +20,37 @@
 #
 # USAGE:
 #   Single-node execution:
-#     sbatch --nodes=1 slurm_scripts/multinode_test_simple.sbatch
-#     MONITOR=true sbatch --nodes=1 slurm_scripts/multinode_test_simple.sbatch
+#     sbatch --nodes=1 slurm_scripts/run.sbatch
+#     MONITOR=true sbatch --nodes=1 slurm_scripts/run.sbatch
 #   
-#   Multi-node execution:
-#     sbatch --nodes=2 slurm_scripts/multinode_test_simple.sbatch
-#     MONITOR=true sbatch --nodes=2 slurm_scripts/multinode_test_simple.sbatch
+#   Multi-node execution (1 high SLO node + 1 low SLO node to test TP):
+#     sbatch --nodes=2 slurm_scripts/run.sbatch
+#     MONITOR=true sbatch --nodes=2 slurm_scripts/run.sbatch
+#   
+#   Multi-node execution to test more nodes:
+#     sbatch --nodes=3 slurm_scripts/run.sbatch  # 1 high + 2 low SLO nodes
 #   
 #   Environment variables:
 #     TEST_TYPE: "simple" or "scaling" (default: "simple")
 #     DEPLOYMENT_MODE: "local", "cluster", or "custom" (default: "cluster")
 #     MONITOR: "true" or "false" (default: "false")
+#     HIGH_SLO_NODE_COUNT: Number of nodes for high SLO pool (default: "2")
+#     LOW_SLO_NODE_COUNT: Number of nodes for low SLO pool (default: "1")
+#
+# ARCHITECTURE:
+#   - Single-node: All pool infrastructure and workers run on one node
+#   - Multi-node: Each node runs its own pool (simpler architecture for testing TP)
+#                 - First HIGH_SLO_NODE_COUNT nodes: run high SLO pools
+#                 - Remaining LOW_SLO_NODE_COUNT nodes: run low SLO pools
+#                 - Head node always runs infrastructure services
+#
+# FOCUS: Testing tensor parallelism (TP) configuration
+#   - High SLO pools use TP=2
+#   - Low SLO pools use TP=1
 #
 # COMPATIBILITY:
 #   - Single-node: Equivalent to "python runner.py --monitor ..."
-#   - Multi-node: Equivalent to "PD_DISAGG=true MONITOR=true sbatch ..." (legacy)
+#   - Multi-node: Simple per-node pool architecture
 
 set -e
 
@@ -52,6 +68,10 @@ CONTAINER_WORKDIR="/workspace/global_scheduler_tests"
 TEST_TYPE=${TEST_TYPE:-"simple"}
 DEPLOYMENT_MODE=${DEPLOYMENT_MODE:-"cluster"}
 MONITOR=${MONITOR:-false}
+
+# Node count parameters for dynamic pool allocation
+HIGH_SLO_NODE_COUNT=${HIGH_SLO_NODE_COUNT:-2}
+LOW_SLO_NODE_COUNT=${LOW_SLO_NODE_COUNT:-1}
 
 # Check if this is single-node or multi-node execution
 if [ "${SLURM_NNODES}" -eq 1 ]; then
@@ -112,30 +132,138 @@ else
     export SLURM_NTASKS=${SLURM_NNODES}
     
     # Export variables for srun
-    export SLURM_JOB_ID TEST_TYPE DEPLOYMENT_MODE MONITOR HEAD_NODE_HOST
+    export SLURM_JOB_ID TEST_TYPE DEPLOYMENT_MODE MONITOR HEAD_NODE_HOST HIGH_SLO_NODE_COUNT LOW_SLO_NODE_COUNT
     
-    # Get list of worker nodes (all nodes except head)
-    WORKER_NODES=$(scontrol show hostname ${SLURM_NODELIST} | tail -n +2 | paste -sd,)
-    echo "Worker nodes: ${WORKER_NODES}"
+    # Get all nodes and determine roles based on HIGH_SLO_NODE_COUNT and LOW_SLO_NODE_COUNT
+    ALL_NODES=($(scontrol show hostname ${SLURM_NODELIST}))
+    TOTAL_NODES=${#ALL_NODES[@]}
+    
+    echo "Total nodes: ${TOTAL_NODES}"
+    echo "HIGH_SLO_NODE_COUNT: ${HIGH_SLO_NODE_COUNT}"
+    echo "LOW_SLO_NODE_COUNT: ${LOW_SLO_NODE_COUNT}"
+    
+    # Validate node count configuration
+    EXPECTED_TOTAL=$((HIGH_SLO_NODE_COUNT + LOW_SLO_NODE_COUNT))
+    if [ ${TOTAL_NODES} -ne ${EXPECTED_TOTAL} ]; then
+        echo "WARNING: Total nodes (${TOTAL_NODES}) doesn't match HIGH_SLO_NODE_COUNT (${HIGH_SLO_NODE_COUNT}) + LOW_SLO_NODE_COUNT (${LOW_SLO_NODE_COUNT}) = ${EXPECTED_TOTAL}"
+        echo "Using actual node count and defaulting extra nodes to low SLO"
+    fi
+    
+    # Determine which nodes run high SLO vs low SLO
+    HIGH_SLO_NODES=()
+    LOW_SLO_NODES=()
+    
+    for i in $(seq 0 $((TOTAL_NODES - 1))); do
+        if [ ${i} -lt ${HIGH_SLO_NODE_COUNT} ]; then
+            HIGH_SLO_NODES+=(${ALL_NODES[i]})
+        else
+            LOW_SLO_NODES+=(${ALL_NODES[i]})
+        fi
+    done
+    
+    echo "High SLO nodes: ${HIGH_SLO_NODES[@]}"
+    echo "Low SLO nodes: ${LOW_SLO_NODES[@]}"
     
     # Initialize array to store worker PIDs
     WORKER_PIDS=()
     
-    # Start worker nodes in the background
-    echo "Starting worker nodes in background..."
-    for worker_node in $(echo ${WORKER_NODES} | tr ',' ' '); do
-        echo "Starting worker node: ${worker_node}"
-        srun --nodes=1 --nodelist="${worker_node}" \
+    # Start high SLO worker nodes (excluding head node)
+    echo "Starting high SLO worker nodes in background..."
+    for node in "${HIGH_SLO_NODES[@]}"; do
+        if [ "${node}" != "${HEAD_NODE}" ]; then
+            echo "Starting high SLO worker node: ${node}"
+            srun --nodes=1 --nodelist="${node}" \
+                 --container-image="${CONTAINER_IMAGE}" \
+                 --container-mounts="${CONTAINER_MOUNTS}" \
+                 --container-workdir="${CONTAINER_WORKDIR}" \
+                 --export=ALL \
+                 bash -c "
+            set -e
+            
+            # Check container environment
+            if [ ! -d \"/workspace\" ]; then
+                echo \"ERROR: /workspace directory not found\"
+                exit 1
+            fi
+            
+            which python
+            source /workspace/venv/bin/activate
+            which python
+            
+            echo \"✅ Container environment confirmed\"
+            echo \"=== HIGH SLO WORKER NODE SETUP ===\"
+            echo \"Current node: \$(hostname)\"
+            
+            # Setup Python path
+            export PYTHONPATH=\$PYTHONPATH:/workspace/deploy/dynamo/sdk/src:/workspace/components/planner/src
+            
+            # Set environment variables for services
+            export NATS_SERVER=\"nats://${HEAD_NODE_HOST}:4222\"
+            export ETCD_ENDPOINTS=\"${HEAD_NODE_HOST}:2379\"
+            export GLOBAL_SCHEDULER_HOST=\"${HEAD_NODE_HOST}\"
+            export GLOBAL_SCHEDULER_PORT=\"3999\"
+            export HIGH_SLO_NODE_COUNT=\"${HIGH_SLO_NODE_COUNT}\"
+            export LOW_SLO_NODE_COUNT=\"${LOW_SLO_NODE_COUNT}\"
+            
+            echo \"NATS_SERVER: \${NATS_SERVER}\"
+            echo \"ETCD_ENDPOINTS: \${ETCD_ENDPOINTS}\"
+            echo \"GLOBAL_SCHEDULER_HOST: \${GLOBAL_SCHEDULER_HOST}\"
+            echo \"HIGH_SLO_NODE_COUNT: \${HIGH_SLO_NODE_COUNT}\"
+            echo \"LOW_SLO_NODE_COUNT: \${LOW_SLO_NODE_COUNT}\"
+            
+            cd /workspace/global_scheduler_tests
+            
+            # Wait for head node services to be ready
+            echo \"Waiting for head node services to be ready...\"
+            sleep 20
+            
+            # Test connectivity to etcd (required for service registration)
+            echo \"Testing connectivity to etcd...\"
+            for i in {1..20}; do
+                if curl -f \"http://${HEAD_NODE_HOST}:2379/health\" >/dev/null 2>&1; then
+                    echo \"✅ etcd connectivity confirmed\"
+                    break
+                fi
+                echo \"Attempt \$i/20: waiting for etcd...\"
+                sleep 5
+            done
+            
+            # Start worker node with high SLO pool
+            echo \"Starting high SLO pool with PD disaggregated architecture on worker node...\"
+            echo \"The pool will register itself with the global scheduler at \${GLOBAL_SCHEDULER_HOST}:\${GLOBAL_SCHEDULER_PORT}\"
+            python runner.py \\
+                --test-type '${TEST_TYPE}' \\
+                --deployment '${DEPLOYMENT_MODE}' \\
+                --config-dir configs \\
+                --multinode \\
+                --head-node-ip '${HEAD_NODE_HOST}' \\
+                --head-node-role high_slo \\
+                --worker-only
+            
+            echo \"High SLO worker node completed: \$(hostname)\"
+            " &
+            
+            # Store background job PID
+            WORKER_PIDS+=($!)
+            echo "High SLO worker node ${node} started with PID ${!}"
+        fi
+    done
+    
+    # Start low SLO worker nodes 
+    echo "Starting low SLO worker nodes in background..."
+    for node in "${LOW_SLO_NODES[@]}"; do
+        echo "Starting low SLO worker node: ${node}"
+        srun --nodes=1 --nodelist="${node}" \
              --container-image="${CONTAINER_IMAGE}" \
              --container-mounts="${CONTAINER_MOUNTS}" \
              --container-workdir="${CONTAINER_WORKDIR}" \
              --export=ALL \
-             bash -c '
+             bash -c "
         set -e
         
         # Check container environment
-        if [ ! -d "/workspace" ]; then
-            echo "ERROR: /workspace directory not found"
+        if [ ! -d \"/workspace\" ]; then
+            echo \"ERROR: /workspace directory not found\"
             exit 1
         fi
         
@@ -143,58 +271,62 @@ else
         source /workspace/venv/bin/activate
         which python
         
-        echo "✅ Container environment confirmed"
-        echo "=== WORKER NODE SETUP ==="
-        echo "Current node: $(hostname)"
+        echo \"✅ Container environment confirmed\"
+        echo \"=== LOW SLO WORKER NODE SETUP ===\"
+        echo \"Current node: \$(hostname)\"
         
         # Setup Python path
-        export PYTHONPATH=$PYTHONPATH:/workspace/deploy/dynamo/sdk/src:/workspace/components/planner/src
+        export PYTHONPATH=\$PYTHONPATH:/workspace/deploy/dynamo/sdk/src:/workspace/components/planner/src
         
         # Set environment variables for services
-        export NATS_SERVER="nats://'${HEAD_NODE_HOST}':4222"
-        export ETCD_ENDPOINTS="'${HEAD_NODE_HOST}':2379"
-        export GLOBAL_SCHEDULER_HOST="'${HEAD_NODE_HOST}'"
-        export GLOBAL_SCHEDULER_PORT="3999"
+        export NATS_SERVER=\"nats://${HEAD_NODE_HOST}:4222\"
+        export ETCD_ENDPOINTS=\"${HEAD_NODE_HOST}:2379\"
+        export GLOBAL_SCHEDULER_HOST=\"${HEAD_NODE_HOST}\"
+        export GLOBAL_SCHEDULER_PORT=\"3999\"
+        export HIGH_SLO_NODE_COUNT=\"${HIGH_SLO_NODE_COUNT}\"
+        export LOW_SLO_NODE_COUNT=\"${LOW_SLO_NODE_COUNT}\"
         
-        echo "NATS_SERVER: ${NATS_SERVER}"
-        echo "ETCD_ENDPOINTS: ${ETCD_ENDPOINTS}"
-        echo "GLOBAL_SCHEDULER_HOST: ${GLOBAL_SCHEDULER_HOST}"
+        echo \"NATS_SERVER: \${NATS_SERVER}\"
+        echo \"ETCD_ENDPOINTS: \${ETCD_ENDPOINTS}\"
+        echo \"GLOBAL_SCHEDULER_HOST: \${GLOBAL_SCHEDULER_HOST}\"
+        echo \"HIGH_SLO_NODE_COUNT: \${HIGH_SLO_NODE_COUNT}\"
+        echo \"LOW_SLO_NODE_COUNT: \${LOW_SLO_NODE_COUNT}\"
         
         cd /workspace/global_scheduler_tests
         
         # Wait for head node services to be ready
-        echo "Waiting for head node services to be ready..."
+        echo \"Waiting for head node services to be ready...\"
         sleep 20
         
         # Test connectivity to etcd (required for service registration)
-        echo "Testing connectivity to etcd..."
+        echo \"Testing connectivity to etcd...\"
         for i in {1..20}; do
-            if curl -f "http://'${HEAD_NODE_HOST}':2379/health" >/dev/null 2>&1; then
-                echo "✅ etcd connectivity confirmed"
+            if curl -f \"http://${HEAD_NODE_HOST}:2379/health\" >/dev/null 2>&1; then
+                echo \"✅ etcd connectivity confirmed\"
                 break
             fi
-            echo "Attempt $i/20: waiting for etcd..."
+            echo \"Attempt \$i/20: waiting for etcd...\"
             sleep 5
         done
         
         # Start worker node with low SLO pool
-        echo "Starting low SLO pool with PD disaggregated architecture on worker node..."
-        echo "The pool will register itself with the global scheduler at ${GLOBAL_SCHEDULER_HOST}:${GLOBAL_SCHEDULER_PORT}"
-        python runner.py \
-            --test-type '${TEST_TYPE}' \
-            --deployment '${DEPLOYMENT_MODE}' \
-            --config-dir configs \
-            --multinode \
-            --head-node-ip '${HEAD_NODE_HOST}' \
-            --head-node-role low_slo \
+        echo \"Starting low SLO pool with PD disaggregated architecture on worker node...\"
+        echo \"The pool will register itself with the global scheduler at \${GLOBAL_SCHEDULER_HOST}:\${GLOBAL_SCHEDULER_PORT}\"
+        python runner.py \\
+            --test-type '${TEST_TYPE}' \\
+            --deployment '${DEPLOYMENT_MODE}' \\
+            --config-dir configs \\
+            --multinode \\
+            --head-node-ip '${HEAD_NODE_HOST}' \\
+            --head-node-role low_slo \\
             --worker-only
         
-        echo "Worker node completed: $(hostname)"
-        ' &
+        echo \"Low SLO worker node completed: \$(hostname)\"
+        " &
         
         # Store background job PID
         WORKER_PIDS+=($!)
-        echo "Worker node ${worker_node} started with PID ${!}"
+        echo "Low SLO worker node ${node} started with PID ${!}"
     done
     
     # Start head node and wait for completion
@@ -204,12 +336,12 @@ else
          --container-mounts="${CONTAINER_MOUNTS}" \
          --container-workdir="${CONTAINER_WORKDIR}" \
          --export=ALL \
-         bash -c '
+         bash -c "
     set -e
     
     # Check container environment
-    if [ ! -d "/workspace" ]; then
-        echo "ERROR: /workspace directory not found"
+    if [ ! -d \"/workspace\" ]; then
+        echo \"ERROR: /workspace directory not found\"
         exit 1
     fi
     
@@ -217,39 +349,49 @@ else
     source /workspace/venv/bin/activate
     which python
     
-    echo "✅ Container environment confirmed"
-    echo "=== HEAD NODE SETUP ==="
-    echo "Current node: $(hostname)"
+    echo \"✅ Container environment confirmed\"
+    echo \"=== HEAD NODE SETUP ===\"
+    echo \"Current node: \$(hostname)\"
     
     # Setup Python path
-    export PYTHONPATH=$PYTHONPATH:/workspace/deploy/dynamo/sdk/src:/workspace/components/planner/src
+    export PYTHONPATH=\$PYTHONPATH:/workspace/deploy/dynamo/sdk/src:/workspace/components/planner/src
     
     # Set environment variables for services
-    export NATS_SERVER="nats://'${HEAD_NODE_HOST}':4222"
-    export ETCD_ENDPOINTS="'${HEAD_NODE_HOST}':2379"
-    export GLOBAL_SCHEDULER_HOST="'${HEAD_NODE_HOST}'"
-    export GLOBAL_SCHEDULER_PORT="3999"
+    export NATS_SERVER=\"nats://${HEAD_NODE_HOST}:4222\"
+    export ETCD_ENDPOINTS=\"${HEAD_NODE_HOST}:2379\"
+    export GLOBAL_SCHEDULER_HOST=\"${HEAD_NODE_HOST}\"
+    export GLOBAL_SCHEDULER_PORT=\"3999\"
+    export HIGH_SLO_NODE_COUNT=\"${HIGH_SLO_NODE_COUNT}\"
+    export LOW_SLO_NODE_COUNT=\"${LOW_SLO_NODE_COUNT}\"
     
-    echo "NATS_SERVER: ${NATS_SERVER}"
-    echo "ETCD_ENDPOINTS: ${ETCD_ENDPOINTS}"
-    echo "GLOBAL_SCHEDULER_HOST: ${GLOBAL_SCHEDULER_HOST}"
+    echo \"NATS_SERVER: \${NATS_SERVER}\"
+    echo \"ETCD_ENDPOINTS: \${ETCD_ENDPOINTS}\"
+    echo \"GLOBAL_SCHEDULER_HOST: \${GLOBAL_SCHEDULER_HOST}\"
+    echo \"HIGH_SLO_NODE_COUNT: \${HIGH_SLO_NODE_COUNT}\"
+    echo \"LOW_SLO_NODE_COUNT: \${LOW_SLO_NODE_COUNT}\"
     
     cd /workspace/global_scheduler_tests
     
-    echo "Starting global scheduler with PD disaggregated architecture on head node..."
+    echo \"Starting global scheduler with PD disaggregated architecture on head node...\"
     
-    # Start head node with infrastructure services and high SLO pool
-    python runner.py \
-        --test-type '${TEST_TYPE}' \
-        --deployment '${DEPLOYMENT_MODE}' \
-        --config-dir configs \
-        $([ "'${MONITOR}'" = "true" ] && echo "--monitor") \
-        --multinode \
-        --head-node-ip '${HEAD_NODE_HOST}' \
-        --head-node-role head_and_high_slo
+    # Determine head node role based on whether it's in high SLO nodes
+    HEAD_NODE_ROLE=\"head_and_high_slo\"
+    if [ \${HIGH_SLO_NODE_COUNT} -eq 0 ]; then
+        HEAD_NODE_ROLE=\"low_slo\"
+    fi
     
-    echo "Head node completed: $(hostname)"
-    '
+    # Start head node with infrastructure services and appropriate pool
+    python runner.py \\
+        --test-type '${TEST_TYPE}' \\
+        --deployment '${DEPLOYMENT_MODE}' \\
+        --config-dir configs \\
+        \$([ \"${MONITOR}\" = \"true\" ] && echo \"--monitor\") \\
+        --multinode \\
+        --head-node-ip '${HEAD_NODE_HOST}' \\
+        --head-node-role \${HEAD_NODE_ROLE}
+    
+    echo \"Head node completed: \$(hostname)\"
+    "
     
     HEAD_EXIT_CODE=$?
     echo "Head node finished with exit code: ${HEAD_EXIT_CODE}"

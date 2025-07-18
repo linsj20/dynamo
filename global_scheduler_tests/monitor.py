@@ -154,12 +154,16 @@ class SystemMonitor:
     """Combined system monitor that orchestrates GPU and Pool monitoring"""
     
     def __init__(self, pool_urls: Dict[str, str], logs_dir: str, 
-                 gpu_interval: float = 2.0, pool_interval: float = 5.0):
+                 gpu_interval: float = 2.0, pool_interval: float = 5.0,
+                 pool_gpu_mapping: Dict[str, List[int]] = None):
         self.gpu_monitor = GPUMonitor(gpu_interval)
         self.pool_monitor = PoolMonitor(pool_urls, pool_interval)
         self.logs_dir = logs_dir
         self.running = False
         self.monitor_tasks: List[asyncio.Task] = []
+        
+        # Pool-specific GPU mapping for enhanced monitoring
+        self.pool_gpu_mapping = pool_gpu_mapping or {}
         
         # Create monitoring log file
         self.monitor_log_file = os.path.join(logs_dir, 'monitor.log')
@@ -238,9 +242,21 @@ class SystemMonitor:
             
             # Also log key metrics to console
             if gpu_summary:
-                gpu_utils = [g['gpu_util'] for g in gpu_summary if 'gpu_util' in g]
-                if gpu_utils:
-                    logger.info(f"GPU Utilization: {gpu_utils} %")
+                if self.pool_gpu_mapping:
+                    # Show GPU utilization per pool
+                    for pool_name, gpu_indices in self.pool_gpu_mapping.items():
+                        pool_gpu_utils = []
+                        for gpu_data in gpu_summary:
+                            if gpu_data['index'] in gpu_indices:
+                                pool_gpu_utils.append(gpu_data['gpu_util'])
+                        if pool_gpu_utils:
+                            avg_util = sum(pool_gpu_utils) / len(pool_gpu_utils)
+                            logger.info(f"{pool_name.upper()} SLO Pool GPU Utilization (GPUs {gpu_indices}): {pool_gpu_utils} % (avg: {avg_util:.1f}%)")
+                else:
+                    # Fallback to overall GPU utilization
+                    gpu_utils = [g['gpu_util'] for g in gpu_summary if 'gpu_util' in g]
+                    if gpu_utils:
+                        logger.info(f"GPU Utilization: {gpu_utils} %")
             
             if pool_summary:
                 pool_statuses = [(p['pool_name'], p['status']) for p in pool_summary]
@@ -296,6 +312,24 @@ class SystemMonitor:
                     if gpu_idx not in gpu_stats:
                         gpu_stats[gpu_idx] = []
                     gpu_stats[gpu_idx].append(data['gpu_util'])
+                
+                # Add pool-specific GPU statistics if mapping is available
+                if self.pool_gpu_mapping:
+                    pool_gpu_stats = {}
+                    for pool_name, gpu_indices in self.pool_gpu_mapping.items():
+                        pool_utils = []
+                        for gpu_idx in gpu_indices:
+                            if gpu_idx in gpu_stats:
+                                pool_utils.extend(gpu_stats[gpu_idx])
+                        if pool_utils:
+                            pool_gpu_stats[pool_name] = {
+                                'avg_utilization': sum(pool_utils) / len(pool_utils),
+                                'max_utilization': max(pool_utils),
+                                'min_utilization': min(pool_utils),
+                                'gpu_count': len(gpu_indices),
+                                'data_points': len(pool_utils)
+                            }
+                    final_report['pool_gpu_stats'] = pool_gpu_stats
                 
                 for gpu_idx, utils in gpu_stats.items():
                     final_report[f'gpu_{gpu_idx}_avg_util'] = sum(utils) / len(utils)
