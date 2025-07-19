@@ -10,6 +10,7 @@ USAGE:
     python runner.py --monitor
     python runner.py --test-type simple --monitor
     python runner.py --test-type scaling --monitor
+    python runner.py --test-type streaming --monitor
   
   Multi-node execution:
     python runner.py --multinode --head-node-ip <IP> --head-node-role head_and_high_slo
@@ -43,6 +44,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'components', 'glo
 from tests.test_base import BaseGlobalSchedulerTest
 from tests.test_simple import SimpleSchedulerTest
 from tests.test_scaling import ScalingTest
+from tests.test_streaming import StreamingSchedulerTest
 from monitor import SystemMonitor
 
 # Configure logging
@@ -598,8 +600,8 @@ class TestRunner:
                     return False
                 
                 # Wait for services to be fully ready
-                logger.info("Waiting for services to initialize (180 seconds)...")
-                time.sleep(180)
+                logger.info("Waiting for services to initialize (240 seconds)...")
+                time.sleep(240)
             
             # Start monitoring if requested
             if self.monitor:
@@ -652,6 +654,9 @@ class TestRunner:
                     result = await test_instance.run()
                 elif self.test_type == "scaling":
                     test_instance = ScalingTest(self.config)
+                    result = await test_instance.run()
+                elif self.test_type == "streaming":
+                    test_instance = StreamingSchedulerTest(self.config)
                     result = await test_instance.run()
                 else:
                     logger.error(f"Unknown test type: {self.test_type}")
@@ -723,7 +728,7 @@ class TestRunner:
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Global Scheduler Test Runner with PD Disaggregated Architecture")
-    parser.add_argument("--test-type", choices=["simple", "scaling"], default="simple",
+    parser.add_argument("--test-type", choices=["simple", "scaling", "streaming"], default="simple",
                        help="Type of test to run (default: simple)")
     parser.add_argument("--deployment", choices=["local", "cluster", "custom"], default="local",
                        help="Deployment mode (default: local)")

@@ -289,10 +289,6 @@ class GlobalScheduler:
             }
             return
         
-        # CRITICAL: Add comprehensive logging to debug routing issues
-        logger.info(f"Routing {request_id} to {pool_config.pool_id}")
-        logger.info(f"DEBUG: Pool config - ID: {pool_config.pool_id}, SLO: {pool_config.slo_level.value}, URL: {pool_config.base_url}")
-        
         # Prepare the request payload for the pool's chat/completions endpoint
         chat_request = {
             "model": pool_config.model_name,  # Use registered model name
@@ -310,14 +306,143 @@ class GlobalScheduler:
         # Make HTTP request to pool's Frontend service
         url = f"{pool_config.base_url}/v1/chat/completions"
         
-        # CRITICAL: Add pre-request logging to verify URL
-        logger.info(f"DEBUG: Making HTTP request to URL: {url}")
-        logger.info(f"DEBUG: Request ID: {request_id}, Pool: {pool_config.pool_id}")
-        
         try:
-            # Use the existing HTTP session for stable connections
-            async with self.http_session.post(url, json=chat_request) as response:
-                    logger.info(f"DEBUG: Received response from {url} with status {response.status}")
+            # Handle streaming vs non-streaming responses
+            if chat_request.get('stream', False):
+                # Streaming request - process SSE stream
+                async with self.http_session.post(url, json=chat_request) as response:
+                    
+                    if not response.status == 200:
+                        error_text = await response.text()
+                        logger.error(f"ERROR: Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}")
+                        yield {
+                            "success": False,
+                            "error": f"Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}",
+                            "assigned_pool": pool_config.pool_id
+                        }
+                        return
+                    
+                    # Process Server-Sent Events stream
+                    is_first_chunk = True
+                    accumulated_content = ""
+                    final_response = None
+                    
+                    async for line in response.content:
+                        if not line:
+                            continue
+                            
+                        line_str = line.decode('utf-8').strip()
+                        
+                        # Skip empty lines and comments
+                        if not line_str or line_str.startswith(':'):
+                            continue
+                        
+                        # Process SSE data lines
+                        if line_str.startswith('data: '):
+                            data_content = line_str[6:]  # Remove 'data: ' prefix
+                            
+                            # Check for end of stream
+                            if data_content == '[DONE]':
+                                break
+                                
+                            try:
+                                # Parse JSON chunk
+                                chunk_data = json.loads(data_content)
+                                
+                                # Extract content from streaming chunk
+                                if 'choices' in chunk_data and chunk_data['choices']:
+                                    choice = chunk_data['choices'][0]
+                                    if 'delta' in choice and 'content' in choice['delta']:
+                                        content = choice['delta']['content']
+                                        accumulated_content += content
+                                        
+                                    
+                                    # Check if this is the final chunk with finish_reason
+                                    if 'finish_reason' in choice and choice['finish_reason'] is not None:
+                                        
+                                        # Create final response in OpenAI format
+                                        final_response = {
+                                            "id": chunk_data.get("id", f"chatcmpl-{request_id}"),
+                                            "object": "chat.completion",
+                                            "created": int(time.time()),
+                                            "model": pool_config.model_name,
+                                            "choices": [{
+                                                "index": 0,
+                                                "message": {
+                                                    "role": "assistant",
+                                                    "content": accumulated_content
+                                                },
+                                                "finish_reason": choice['finish_reason']
+                                            }]
+                                        }
+                                        
+                                        # Add usage information if available from the last chunk
+                                        if 'usage' in chunk_data:
+                                            final_response['usage'] = chunk_data['usage']
+                                        break
+                                
+                                # Yield intermediate streaming status (if first chunk)
+                                if is_first_chunk:
+                                    is_first_chunk = False
+                                    yield {
+                                        "success": True,
+                                        "assigned_pool": pool_config.pool_id,
+                                        "pool_url": pool_config.base_url,
+                                        "model_used": pool_config.model_name,
+                                        "streaming": True,
+                                        "first_token_received": True
+                                    }
+                                
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"WARNING: Failed to parse streaming chunk: {e}, data: {data_content}")
+                                continue
+                    
+                    # Yield final complete response
+                    if final_response:
+                        yield {
+                            "success": True,
+                            "assigned_pool": pool_config.pool_id,
+                            "pool_url": pool_config.base_url,
+                            "model_used": pool_config.model_name,
+                            "response": final_response,
+                            "streaming": True,
+                            "total_content_length": len(accumulated_content)
+                        }
+                    elif accumulated_content:
+                        # Create final response even if we didn't get explicit finish_reason
+                        final_response = {
+                            "id": f"chatcmpl-{request_id}",
+                            "object": "chat.completion",
+                            "created": int(time.time()),
+                            "model": pool_config.model_name,
+                            "choices": [{
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": accumulated_content
+                                },
+                                "finish_reason": "stop"  # Default finish reason
+                            }]
+                        }
+                        yield {
+                            "success": True,
+                            "assigned_pool": pool_config.pool_id,
+                            "pool_url": pool_config.base_url,
+                            "model_used": pool_config.model_name,
+                            "response": final_response,
+                            "streaming": True,
+                            "total_content_length": len(accumulated_content)
+                        }
+                    else:
+                        logger.warning(f"WARNING: No content received for streaming request {request_id}")
+                        yield {
+                            "success": False,
+                            "error": "Stream ended without final response",
+                            "assigned_pool": pool_config.pool_id
+                        }
+            else:
+                # Non-streaming request (legacy support)
+                async with self.http_session.post(url, json=chat_request) as response:
                     
                     if not response.status == 200:
                         error_text = await response.text()
@@ -395,16 +520,11 @@ class GlobalScheduler:
         Returns:
             Pool configuration if available, None if no suitable pool found
         """
-        # DEBUG: Log current pool state
-        logger.info(f"DEBUG: Looking for pool with SLO level: {slo_level.value}")
-        logger.info(f"DEBUG: Available pools: {[(p.pool_id, p.slo_level.value, p.base_url) for p in self.pools.values()]}")
-        
         # Filter pools by SLO level
         matching_pools = [pool for pool in self.pools.values() if pool.slo_level == slo_level]
         
         if matching_pools:
             selected_pool = matching_pools[0]
-            logger.info(f"DEBUG: Selected pool: {selected_pool.pool_id} (SLO: {selected_pool.slo_level.value}, URL: {selected_pool.base_url})")
             return selected_pool
         
         # Fallback: if no exact match, try to find a higher SLO level pool
@@ -422,10 +542,9 @@ class GlobalScheduler:
         
         if fallback_pools:
             selected_pool = fallback_pools[0]
-            logger.info(f"DEBUG: Using fallback pool: {selected_pool.pool_id} (SLO: {selected_pool.slo_level.value}, URL: {selected_pool.base_url})")
             return selected_pool
         
-        logger.warning(f"DEBUG: No suitable pool found for SLO level: {slo_level.value}")
+        logger.warning(f"No suitable pool found for SLO level: {slo_level.value}")
         return None
 
     async def cleanup(self):

@@ -30,6 +30,14 @@ class TestRequest:
     assigned_pool: Optional[str] = None
     response_data: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    
+    # Streaming-specific metrics
+    ttft: Optional[float] = None  # Time to First Token
+    tpot: Optional[float] = None  # Time Per Output Token
+    chunk_count: int = 0         # Number of streaming chunks received
+    total_content_length: int = 0 # Total length of generated content
+    output_token_count: int = 0  # Number of output tokens generated
+    is_streaming: bool = True    # Whether this was a streaming request
 
 class BaseGlobalSchedulerTest(ABC):
     """Base class for all Global Scheduler tests"""
@@ -193,78 +201,98 @@ class BaseGlobalSchedulerTest(ABC):
         start_time = time.time()
         
         try:
-            # Prepare request data
+            # Prepare request data with streaming enabled
             request_data = {
                 "request_id": request.request_id,
                 "slo_requirement": request.slo_requirement,
                 "prompt": request.prompt,
                 "max_tokens": request.max_tokens,
                 "temperature": request.temperature,
-                "stream": False
+                "stream": True  # Enable streaming responses
             }
             
             # Send request to Global Scheduler
             response = await self.scheduler_client.generate(request_data)
             
-            # Read response
-            response_data = None
-            async for item in response:
-                response_data = item
-                break
+            # Process streaming response
+            first_token_time = None
+            response_chunks = []
+            final_response_data = None
             
-            # Calculate response time
+            async for item in response:
+                # Handle potential Annotated type wrapper
+                actual_response_data = self._extract_response_data(item)
+                
+                # Skip None responses (happens with intermediate Annotated responses)
+                if actual_response_data is None:
+                    continue
+                
+                # Track first token time for TTFT metrics
+                if first_token_time is None:
+                    first_token_time = time.time()
+                    
+                response_chunks.append(actual_response_data)
+                
+                # If this is an error response, stop processing
+                if not actual_response_data.get('success', True):
+                    final_response_data = actual_response_data
+                    break
+                    
+                # For successful streaming responses, collect the final complete response
+                if actual_response_data.get('success', False):
+                    final_response_data = actual_response_data
+            
+            # Calculate response metrics
             end_time = time.time()
             request.response_time = end_time - start_time
             
-            # Handle potential Annotated type wrapper bug in Dynamo runtime
-            actual_response_data = response_data
-            
-            # Check if this is a Dynamo Annotated object (has .data() method)
-            if hasattr(response_data, 'data') and callable(getattr(response_data, 'data')):
-                # This is a Dynamo Annotated object - call the data() method
-                actual_response_data = response_data.data()
-                logger.debug(f"Extracted data from Annotated object: {type(actual_response_data)}")
-            elif hasattr(response_data, '__origin__') or str(type(response_data)).startswith("<class 'typing."):
-                # This is likely a typing.Annotated type wrapper - try to extract the actual data
-                if hasattr(response_data, '__args__') and response_data.__args__:
-                    actual_response_data = response_data.__args__[0]
-                else:
-                    logger.error(f"FAIL: Received unexpected type: {type(response_data)} - {response_data}")
-                    request.success = False
-                    request.error = f"Runtime returned unexpected type: {type(response_data)}"
-                    return request
-            
-            # Check if request was successful
-            if actual_response_data and hasattr(actual_response_data, 'get'):
-                if actual_response_data.get('success', False):
+            # Calculate and store TTFT (Time to First Token) if we got streaming data
+            if first_token_time:
+                request.ttft = first_token_time - start_time
+                logger.info(f"TTFT for {request.request_id}: {request.ttft:.3f}s")
+                
+            # Store streaming metrics
+            request.chunk_count = len(response_chunks)
+            request.is_streaming = True
+                
+            # Process final response
+            if final_response_data:
+                if final_response_data.get('success', False):
                     request.success = True
-                    request.assigned_pool = actual_response_data.get('assigned_pool')
-                    request.response_data = actual_response_data
+                    request.assigned_pool = final_response_data.get('assigned_pool')
+                    request.response_data = final_response_data
                     
-                    # Extract and print meaningful response content
-                    self._print_response_summary(request, actual_response_data)
+                    # Extract content length and token count from response
+                    if 'response' in final_response_data:
+                        llm_response = final_response_data['response']
+                        if isinstance(llm_response, dict) and 'choices' in llm_response and llm_response['choices']:
+                            content = llm_response['choices'][0].get('message', {}).get('content', '')
+                            request.total_content_length = len(content)
+                            
+                            # Try to get actual token count from response usage info
+                            if 'usage' in llm_response and llm_response['usage'] is not None:
+                                request.output_token_count = llm_response['usage'].get('completion_tokens', 0)
+                            else:
+                                # Estimate token count (rough approximation: ~4 chars per token)
+                                request.output_token_count = max(1, len(content) // 4)
+                    
+                    # Calculate TPOT (Time Per Output Token) if we have TTFT and token count
+                    if request.ttft is not None and request.output_token_count > 0:
+                        generation_time = request.response_time - request.ttft
+                        request.tpot = generation_time / request.output_token_count
+                        logger.info(f"TPOT for {request.request_id}: {request.tpot:.3f}s/token ({request.output_token_count} tokens)")
+                    
+                    # Enhanced response summary for streaming
+                    self._print_streaming_response_summary(request, final_response_data, len(response_chunks))
                     
                 else:
                     request.success = False
-                    request.error = actual_response_data.get('error', 'Unknown error')
-                    logger.error(f"FAIL: Request failed: {request.error}")
-            elif isinstance(actual_response_data, dict):
-                if actual_response_data.get('success', False):
-                    request.success = True
-                    request.assigned_pool = actual_response_data.get('assigned_pool')
-                    request.response_data = actual_response_data
-                    
-                    # Extract and print meaningful response content
-                    self._print_response_summary(request, actual_response_data)
-                    
-                else:
-                    request.success = False
-                    request.error = actual_response_data.get('error', 'Unknown error')
+                    request.error = final_response_data.get('error', 'Unknown error')
                     logger.error(f"FAIL: Request failed: {request.error}")
             else:
                 request.success = False
-                request.error = f'Invalid response format: {type(actual_response_data)} - {actual_response_data}'
-                logger.error(f"FAIL: Request failed: {request.error}")
+                request.error = "No response data received from streaming request"
+                logger.error(f"FAIL: {request.error}")
             
         except Exception as e:
             request.success = False
@@ -274,9 +302,31 @@ class BaseGlobalSchedulerTest(ABC):
         
         return request
     
-    def _print_response_summary(self, request: TestRequest, response_data: Dict[str, Any]):
-        """Print a summary of the response in a readable format"""
-        logger.info(f"PASS: {request.request_id}: {request.response_time:.2f}s -> {request.assigned_pool}")
+    def _extract_response_data(self, response_item):
+        """Extract response data from potentially wrapped Dynamo objects"""
+        # Check if this is a Dynamo Annotated object (has .data() method)
+        if hasattr(response_item, 'data') and callable(getattr(response_item, 'data')):
+            # This is a Dynamo Annotated object - call the data() method
+            # Note: data() can return None, so we need to handle that
+            data = response_item.data()
+            if data is not None:
+                return data
+            else:
+                # Skip None data responses - this happens with intermediate Annotated responses
+                return None
+        
+        # For non-Annotated objects, return as-is
+        return response_item
+    
+    def _print_streaming_response_summary(self, request: TestRequest, response_data: Dict[str, Any], chunk_count: int):
+        """Print a summary of the streaming response in a readable format"""
+        metrics_str = f"{request.response_time:.2f}s -> {request.assigned_pool} ({chunk_count} chunks"
+        if request.ttft is not None:
+            metrics_str += f", TTFT: {request.ttft:.3f}s"
+        if request.tpot is not None:
+            metrics_str += f", TPOT: {request.tpot:.3f}s/tok"
+        metrics_str += ")"
+        logger.info(f"PASS: {request.request_id}: {metrics_str}")
         
         # Extract the actual LLM response
         llm_response = response_data.get('response', {})
@@ -290,6 +340,7 @@ class BaseGlobalSchedulerTest(ABC):
                     if len(message_content) > 100:
                         preview += "..."
                     logger.info(f"   Response: \"{preview}\"")
+                    logger.info(f"   Full length: {len(message_content)} characters")
                 else:
                     logger.info(f"   Response: [No content in message]")
             else:
@@ -309,6 +360,7 @@ class BaseGlobalSchedulerTest(ABC):
         total_requests = len(self.results)
         successful_requests = sum(1 for r in self.results if r.success)
         failed_requests = total_requests - successful_requests
+        streaming_requests = sum(1 for r in self.results if r.is_streaming)
         
         # Overall stats
         avg_response_time = sum(r.response_time for r in self.results) / total_requests
@@ -316,18 +368,52 @@ class BaseGlobalSchedulerTest(ABC):
         logger.info(f"Total Requests: {total_requests}")
         logger.info(f"Successful: {successful_requests}")
         logger.info(f"Failed: {failed_requests}")
+        logger.info(f"Streaming: {streaming_requests}")
         logger.info(f"Average Response Time: {avg_response_time:.3f}s")
+        
+        # Streaming metrics
+        successful_streaming = [r for r in self.results if r.success and r.is_streaming]
+        if successful_streaming:
+            ttft_values = [r.ttft for r in successful_streaming if r.ttft is not None]
+            if ttft_values:
+                avg_ttft = sum(ttft_values) / len(ttft_values)
+                min_ttft = min(ttft_values)
+                max_ttft = max(ttft_values)
+                logger.info(f"TTFT: avg={avg_ttft:.3f}s, min={min_ttft:.3f}s, max={max_ttft:.3f}s")
+            
+            tpot_values = [r.tpot for r in successful_streaming if r.tpot is not None]
+            if tpot_values:
+                avg_tpot = sum(tpot_values) / len(tpot_values)
+                min_tpot = min(tpot_values)
+                max_tpot = max(tpot_values)
+                logger.info(f"TPOT: avg={avg_tpot:.3f}s/tok, min={min_tpot:.3f}s/tok, max={max_tpot:.3f}s/tok")
+            
+            avg_chunk_count = sum(r.chunk_count for r in successful_streaming) / len(successful_streaming)
+            avg_content_length = sum(r.total_content_length for r in successful_streaming) / len(successful_streaming)
+            avg_token_count = sum(r.output_token_count for r in successful_streaming) / len(successful_streaming)
+            logger.info(f"Avg Chunks per Request: {avg_chunk_count:.1f}")
+            logger.info(f"Avg Content Length: {avg_content_length:.0f} chars")
+            logger.info(f"Avg Output Tokens: {avg_token_count:.1f} tokens")
         
         # Break down by SLO level
         slo_stats = {}
         for request in self.results:
             slo = request.slo_requirement
             if slo not in slo_stats:
-                slo_stats[slo] = {'total': 0, 'success': 0, 'total_time': 0.0}
+                slo_stats[slo] = {
+                    'total': 0, 'success': 0, 'total_time': 0.0, 
+                    'ttft_values': [], 'tpot_values': [], 'chunk_counts': [], 'token_counts': []
+                }
             
             slo_stats[slo]['total'] += 1
             if request.success:
                 slo_stats[slo]['success'] += 1
+                if request.ttft is not None:
+                    slo_stats[slo]['ttft_values'].append(request.ttft)
+                if request.tpot is not None:
+                    slo_stats[slo]['tpot_values'].append(request.tpot)
+                slo_stats[slo]['chunk_counts'].append(request.chunk_count)
+                slo_stats[slo]['token_counts'].append(request.output_token_count)
             slo_stats[slo]['total_time'] += request.response_time
         
         logger.info("\nSLO Level Breakdown:")
@@ -335,6 +421,25 @@ class BaseGlobalSchedulerTest(ABC):
             success_rate = (stats['success'] / stats['total']) * 100
             avg_time = stats['total_time'] / stats['total']
             logger.info(f"  {slo.upper()}: {stats['success']}/{stats['total']} ({success_rate:.1f}%) - Avg: {avg_time:.3f}s")
+            
+            # TTFT stats per SLO
+            if stats['ttft_values']:
+                avg_ttft = sum(stats['ttft_values']) / len(stats['ttft_values'])
+                logger.info(f"    TTFT: {avg_ttft:.3f}s")
+            
+            # TPOT stats per SLO
+            if stats['tpot_values']:
+                avg_tpot = sum(stats['tpot_values']) / len(stats['tpot_values'])
+                logger.info(f"    TPOT: {avg_tpot:.3f}s/tok")
+            
+            # Average chunks and tokens per SLO
+            if stats['chunk_counts']:
+                avg_chunks = sum(stats['chunk_counts']) / len(stats['chunk_counts'])
+                logger.info(f"    Avg Chunks: {avg_chunks:.1f}")
+            
+            if stats['token_counts']:
+                avg_tokens = sum(stats['token_counts']) / len(stats['token_counts'])
+                logger.info(f"    Avg Tokens: {avg_tokens:.1f}")
         
         # Pool assignment breakdown
         pool_stats = {}
