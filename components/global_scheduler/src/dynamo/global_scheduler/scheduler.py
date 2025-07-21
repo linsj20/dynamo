@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -166,10 +167,19 @@ class GlobalScheduler:
             description=description or f"{slo_level.value.title()} priority pool"
         )
         
+        # Assert that pool_id is unique - it should always be different
+        assert pool_id not in self.pools, f"Pool ID '{pool_id}' already exists! Pool IDs must be unique."
+        
         # Register the pool
         self.pools[pool_id] = pool_config
         
+        # Count pools by SLO level for load balancing status
+        slo_pool_counts = {}
+        for slo in SLOLevel:
+            slo_pool_counts[slo.value] = len([p for p in self.pools.values() if p.slo_level == slo])
+        
         logger.info(f"Registered pool: {pool_id} at {base_url} (SLO: {slo_level.value}, model: {model_name})")
+        logger.info(f"Pool counts by SLO level: {slo_pool_counts} (random load balancing enabled)")
         
         yield {
             "success": True,
@@ -207,7 +217,14 @@ class GlobalScheduler:
         
         if pool_id in self.pools:
             del self.pools[pool_id]
+            
+            # Count pools by SLO level after removal
+            slo_pool_counts = {}
+            for slo in SLOLevel:
+                slo_pool_counts[slo.value] = len([p for p in self.pools.values() if p.slo_level == slo])
+            
             logger.info(f"Unregistered pool: {pool_id}")
+            logger.info(f"Pool counts by SLO level: {slo_pool_counts} (random load balancing)")
             yield {
                 "success": True,
                 "message": f"Pool {pool_id} unregistered successfully",
@@ -469,7 +486,7 @@ class GlobalScheduler:
             logger.error(f"ERROR: HTTP request to {url} failed: {e}")
             yield {
                 "success": False,
-                "error": f"HTTP request to pool {pool_config.pool_id} failed: {e}",
+                "error": f"HTTP request to pool {pool_config.pool_id} failed: {error_type}: {e}",
                 "assigned_pool": pool_config.pool_id
             }
     
@@ -488,7 +505,7 @@ class GlobalScheduler:
         
         for pool_id, pool_config in self.pools.items():
             # Test current connectivity - let errors crash immediately
-            async with self.http_session.get(f"{pool_config.base_url}/health", timeout=5) as response:
+            async with self.http_session.get(f"{pool_config.base_url}/health", timeout=30) as response:  # Increased from 5s to 30s
                 connected = response.status == 200
                 
             pool_statuses[pool_id] = {
@@ -512,7 +529,7 @@ class GlobalScheduler:
     
     def _get_pool_for_slo(self, slo_level: SLOLevel) -> Optional[PoolConfig]:
         """
-        Find the best available pool for the requested SLO level.
+        Find the best available pool for the requested SLO level using random selection.
         
         Args:
             slo_level: SLO requirement level
@@ -524,10 +541,14 @@ class GlobalScheduler:
         matching_pools = [pool for pool in self.pools.values() if pool.slo_level == slo_level]
         
         if matching_pools:
-            selected_pool = matching_pools[0]
+            # Simple random selection among pools of the same SLO level
+            selected_pool = random.choice(matching_pools)
+            
+            logger.info(f"RANDOM: Selected pool {selected_pool.pool_id} for {slo_level.value} SLO - {selected_pool.base_url}")
+            
             return selected_pool
         
-        # Fallback: if no exact match, try to find a higher SLO level pool
+        # Fallback: if no exact match, try to find a higher SLO level pool using round-robin
         if slo_level == SLOLevel.LOW:
             # Low can use medium or high
             fallback_pools = [pool for pool in self.pools.values() 
@@ -541,7 +562,12 @@ class GlobalScheduler:
             fallback_pools = []
         
         if fallback_pools:
-            selected_pool = fallback_pools[0]
+            # Simple random selection among fallback pools
+            selected_pool = random.choice(fallback_pools)
+            
+            logger.info(f"RANDOM FALLBACK: Using pool {selected_pool.pool_id} (SLO: {selected_pool.slo_level.value}) "
+                       f"for requested {slo_level.value} SLO - {selected_pool.base_url}")
+            
             return selected_pool
         
         logger.warning(f"No suitable pool found for SLO level: {slo_level.value}")

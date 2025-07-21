@@ -40,7 +40,9 @@ async def clear_namespace(runtime: DistributedRuntime, namespace: str):
     logger.info(f"Cleared /{namespace} in EtcdKvCache")
 
     prefill_queue_nats_server = os.getenv("NATS_SERVER", "nats://localhost:4222")
-    prefill_queue_stream_name = f"{namespace}_prefill_queue"
+    # Use pool-specific queue name to clear the correct queue for this pool
+    from utils.pool_isolation import get_unique_prefill_queue_name
+    prefill_queue_stream_name = get_unique_prefill_queue_name(namespace)
     async with PrefillQueue.get_instance(
         nats_server=prefill_queue_nats_server,
         stream_name=prefill_queue_stream_name,

@@ -58,7 +58,9 @@ class VllmWorker:
         )
         # Use dynamo_context["namespace"] to get the actual runtime namespace, not the hardcoded one
         self.namespace = dynamo_context["namespace"]
-        self._prefill_queue_stream_name = f"{self.namespace}_prefill_queue"
+        # Use pool-specific queue name to ensure complete isolation between pools
+        from utils.pool_isolation import get_unique_prefill_queue_name
+        self._prefill_queue_stream_name = get_unique_prefill_queue_name(self.namespace)
         logger.info(
             f"Prefill queue: {self._prefill_queue_nats_server}:{self._prefill_queue_stream_name}"
         )
@@ -102,30 +104,21 @@ class VllmWorker:
             self.engine_client = await self._engine_context.__aenter__()
         else:
             raise RuntimeError("Failed to initialize engine client")
-        self.engine_client.set_metrics_publisher(self.metrics_publisher)
-        # Initially send dummy metrics to kick start,
-        # vLLM will not update stat until forward pass is triggered
-        self.metrics_publisher.publish(
-            0,  # request_active_slots
-            1024,  # request_total_slots
-            0,  # kv_active_blocks
-            1024,  # kv_total_blocks
-            0,  # num_requests_waiting
-            0.0,  # gpu_cache_usage_perc
-            0.0,  # gpu_prefix_cache_hit_rate
-        )
-        task = asyncio.create_task(self.create_metrics_publisher_endpoint())
-        task.add_done_callback(
-            lambda _: logger.info("metrics publisher endpoint created")
-        )
 
         runtime = dynamo_context["runtime"]
 
         if self.engine_args.remote_prefill:
             metadata = self.engine_client.nixl_metadata
             # Use dynamic namespace instead of hardcoded "dynamo"
-            metadata_store = NixlMetadataStore(self.namespace, runtime)
+            # Use pool-specific namespace to ensure complete isolation between pools
+            from utils.pool_isolation import get_unique_nixl_namespace
+            unique_namespace = get_unique_nixl_namespace(self.namespace)
+            metadata_store = NixlMetadataStore(unique_namespace, runtime)
             await metadata_store.put(metadata.engine_id, metadata)
+
+        # Validate pool isolation
+        from utils.pool_isolation import validate_pool_isolation
+        validate_pool_isolation(self.namespace)
 
         if self.engine_args.conditional_disagg:
             self.disaggregated_router = PyDisaggregatedRouter(

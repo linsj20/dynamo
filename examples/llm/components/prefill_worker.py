@@ -87,7 +87,15 @@ class PrefillWorker:
         metadata = self.engine_client.nixl_metadata
         # Use dynamic namespace instead of hardcoded "dynamo"
         namespace = dynamo_context["namespace"]
-        self._metadata_store = NixlMetadataStore(namespace, runtime)
+        
+        # Validate pool isolation
+        from utils.pool_isolation import validate_pool_isolation
+        validate_pool_isolation(namespace)
+        
+        # Use pool-specific namespace to ensure complete isolation between pools
+        from utils.pool_isolation import get_unique_nixl_namespace
+        unique_namespace = get_unique_nixl_namespace(namespace)
+        self._metadata_store = NixlMetadataStore(unique_namespace, runtime)
         await self._metadata_store.put(metadata.engine_id, metadata)
         self.task = asyncio.create_task(self.prefill_queue_handler())
 
@@ -143,10 +151,13 @@ class PrefillWorker:
         prefill_queue_nats_server = os.getenv("NATS_SERVER", "nats://localhost:4222")
         # Use dynamo_context["namespace"] to get the actual runtime namespace, not the hardcoded one
         namespace = dynamo_context["namespace"]
-        prefill_queue_stream_name = f"{namespace}_prefill_queue"
+        # Use pool-specific queue name to ensure complete isolation between pools
+        from utils.pool_isolation import get_unique_prefill_queue_name
+        prefill_queue_stream_name = get_unique_prefill_queue_name(namespace)
         logger.info(
             f"Prefill queue: {prefill_queue_nats_server}:{prefill_queue_stream_name}"
         )
+        
         self.initialized = True
         # TODO: integrate prefill_queue to a dynamo endpoint
         async with PrefillQueue.get_instance(
@@ -159,11 +170,10 @@ class PrefillWorker:
                 # need to test and check how much overhead it is
                 prefill_request = await prefill_queue.dequeue_prefill_request()
                 if prefill_request is not None:
-                    logger.info(
-                        f"Dequeued prefill request: {prefill_request.request_id}"
-                    )
+                    logger.info(f"Dequeued prefill request: {prefill_request.request_id}")
                     async for _ in self.generate(prefill_request):
                         pass
+                        
                 if self.shutdown_requested:
                     logger.info(
                         "Shutdown requested, checking if engine has any pending prefill sending requests"

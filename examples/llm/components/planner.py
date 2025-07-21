@@ -83,7 +83,9 @@ class Planner:
         self._prefill_queue_nats_server = os.getenv(
             "NATS_SERVER", "nats://localhost:4222"
         )
-        self._prefill_queue_stream_name = f"{self.namespace}_prefill_queue"
+        # Use pool-specific queue name to ensure complete isolation between pools
+        from utils.pool_isolation import get_unique_prefill_queue_name
+        self._prefill_queue_stream_name = get_unique_prefill_queue_name(self.namespace)
 
         self.prefill_client: Client | None = None
         self.workers_client: Client | None = None
@@ -96,6 +98,10 @@ class Planner:
         self.writer = SummaryWriter(args.log_dir)
 
         logger.info(f"Components present in namespace: {args.namespace}")
+        
+        # Log pool isolation information
+        from utils.pool_isolation import log_pool_isolation_info
+        log_pool_isolation_info()
 
         self.init_time = time.time()
         # Set the appropriate logger function for repeated metric logging
@@ -256,10 +262,20 @@ class Planner:
         )
         avg_kv_load = np.mean(self.kv_load)
         # first check if we need to scale down any workers
+        # Use very conservative threshold ONLY when scaling down the last worker to 0
+        SCALE_TO_ZERO_CONSERVATIVE_THRESHOLD = 0.01  # Very low threshold for scaling to 0 workers
+        
+        # Determine prefill scale down threshold - be conservative only when scaling to 0
+        prefill_scale_down_threshold = self.args.prefill_queue_scale_down_threshold
+        is_scaling_prefill_to_zero = (len(self.p_endpoints) == 1 and self.args.min_endpoint == 0)
+        
+        if is_scaling_prefill_to_zero:
+            prefill_scale_down_threshold = SCALE_TO_ZERO_CONSERVATIVE_THRESHOLD
+            logger.info(f"Scaling prefill workers to ZERO, using conservative threshold: {prefill_scale_down_threshold}")
+        
         if (
-            avg_prefill_queue_load < self.args.prefill_queue_scale_down_threshold
+            avg_prefill_queue_load < prefill_scale_down_threshold
             and len(self.p_endpoints) > self.args.min_endpoint
-            and len(self.p_endpoints) > 1
         ):
             logger.info(
                 f"Average prefill queue load ({avg_prefill_queue_load:.2f}) is below threshold ({self.args.prefill_queue_scale_down_threshold:.2f}), scaling down prefill workers"
@@ -269,10 +285,18 @@ class Planner:
                 curr_gpu_usage -= self.args.prefill_engine_num_gpu
             else:
                 logger.info("Failed to scale down prefill worker")
+        
+        # Determine decode scale down threshold - be conservative only when scaling to 0
+        decode_scale_down_threshold = self.args.decode_kv_scale_down_threshold
+        is_scaling_decode_to_zero = (len(self.d_endpoints) == 1 and self.args.min_endpoint == 0)
+        
+        if is_scaling_decode_to_zero:
+            decode_scale_down_threshold = SCALE_TO_ZERO_CONSERVATIVE_THRESHOLD
+            logger.info(f"Scaling decode workers to ZERO, using conservative threshold: {decode_scale_down_threshold}")
+            
         if (
-            avg_kv_load < self.args.decode_kv_scale_down_threshold
+            avg_kv_load < decode_scale_down_threshold
             and len(self.d_endpoints) > self.args.min_endpoint
-            and len(self.p_endpoints) > 1
         ):
             if self.decode_worker_remaining_grace_period > 0:
                 logger.info(
@@ -362,18 +386,23 @@ class Planner:
             self.decode_worker_remaining_grace_period -= 1
 
     async def ensure_minimum_workers(self):
-        """Launch 1 prefill worker and 1 decode worker in parallel (non-blocking)"""
-        logger.info("Launching 1 prefill worker and 1 decode worker in parallel...")
+        """Launch 1 prefill worker first, then 1 decode worker 15s later to ensure proper initialization order"""
+        logger.info("Launching 1 prefill worker first, then 1 decode worker with 15s delay...")
         
-        # Launch both workers in parallel with non-blocking mode
-        # They will start immediately and register asynchronously as they become ready
+        # Start prefill worker first to establish NIXL metadata coordination
         prefill_success = await self.connector.add_component("PrefillWorker", blocking=False)
-        vllm_success = await self.connector.add_component("VllmWorker", blocking=False)
         
         if prefill_success:
             logger.info("Successfully started prefill worker (will register asynchronously)")
         else:
             logger.error("Failed to start prefill worker")
+            
+        # Wait 15 seconds to allow prefill worker to initialize and store metadata
+        logger.info("Waiting 15 seconds for prefill worker to initialize before starting decode worker...")
+        await asyncio.sleep(15)
+        
+        # Now start decode worker - this ensures proper initialization order
+        vllm_success = await self.connector.add_component("VllmWorker", blocking=False)
         
         if vllm_success:
             logger.info("Successfully started decode worker (will register asynchronously)")
@@ -381,8 +410,8 @@ class Planner:
             logger.error("Failed to start decode worker")
         
         # Log current state - workers may not be registered yet, that's expected
-        logger.info("Both workers started, they will register as they become ready")
-        logger.info("Note: Workers are loading models in parallel and will register asynchronously")
+        logger.info("Both workers started with proper initialization order, they will register as they become ready")
+        logger.info("Note: Workers are loading models and will register asynchronously")
 
     async def run(self):
         """Main loop for the planner"""

@@ -81,15 +81,66 @@ def determine_pool_info_from_port(port: int):
         return f"pool_{port}", "medium"
 
 
+def determine_pool_info_from_hostname_and_namespace(hostname: str, namespace: str):
+    """Determine pool ID and SLO level from hostname and namespace."""
+    logger.info(f"DEBUG: Using provided hostname: {hostname}")
+    
+    # Clean hostname to be safe for pool_id (remove dots, etc)
+    hostname_safe = hostname.replace(".", "_").replace("-", "_")
+    logger.info(f"DEBUG: Safe hostname: {hostname_safe}")
+    
+    # Map namespace to pool information with hostname-specific pool_id
+    if "high" in namespace.lower():
+        pool_id = f"high_slo_pool_{hostname_safe}"
+        logger.info(f"DEBUG: Generated pool_id for high SLO: {pool_id}")
+        return pool_id, "high"
+    elif "low" in namespace.lower():
+        pool_id = f"low_slo_pool_{hostname_safe}"
+        logger.info(f"DEBUG: Generated pool_id for low SLO: {pool_id}")
+        return pool_id, "low"
+    elif "medium" in namespace.lower():
+        pool_id = f"medium_slo_pool_{hostname_safe}"
+        logger.info(f"DEBUG: Generated pool_id for medium SLO: {pool_id}")
+        return pool_id, "medium"
+    else:
+        raise RuntimeError(f"Invalid pool namespace: {namespace}")
+
+
 def determine_pool_info_from_namespace(namespace: str):
     """Determine pool ID and SLO level from namespace."""
-    # Map namespace to pool information
+    import socket
+    import os
+    
+    # Get node name for unique pool_id
+    node_ip = os.environ.get("NODE_IP")
+    hostname_env = os.environ.get("HOSTNAME")
+    socket_hostname = socket.gethostname()
+    
+    # Debug logging for hostname resolution
+    logger.info(f"DEBUG: NODE_IP env var: {node_ip}")
+    logger.info(f"DEBUG: HOSTNAME env var: {hostname_env}")
+    logger.info(f"DEBUG: socket.gethostname(): {socket_hostname}")
+    
+    node_name = node_ip or hostname_env or socket_hostname
+    logger.info(f"DEBUG: Selected node_name: {node_name}")
+    
+    # Clean node name to be safe for pool_id (remove dots, etc)
+    node_name_safe = node_name.replace(".", "_").replace("-", "_")
+    logger.info(f"DEBUG: Safe node_name: {node_name_safe}")
+    
+    # Map namespace to pool information with node-specific pool_id
     if "high" in namespace.lower():
-        return "high_slo_pool", "high"
+        pool_id = f"high_slo_pool_{node_name_safe}"
+        logger.info(f"DEBUG: Generated pool_id for high SLO: {pool_id}")
+        return pool_id, "high"
     elif "low" in namespace.lower():
-        return "low_slo_pool", "low"
+        pool_id = f"low_slo_pool_{node_name_safe}"
+        logger.info(f"DEBUG: Generated pool_id for low SLO: {pool_id}")
+        return pool_id, "low"
     elif "medium" in namespace.lower():
-        return "medium_slo_pool", "medium"
+        pool_id = f"medium_slo_pool_{node_name_safe}"
+        logger.info(f"DEBUG: Generated pool_id for medium SLO: {pool_id}")
+        return pool_id, "medium"
     else:
         raise RuntimeError(f"Invalid pool namespace: {namespace}")
 
@@ -199,14 +250,19 @@ class Frontend:
         self.namespace = dynamo_context["namespace"]
         logger.info(f"Final namespace: {self.namespace}")
         
-        # Determine pool information from namespace
-        self.pool_id, self.slo_level = determine_pool_info_from_namespace(self.namespace)
-        logger.info(f"Pool ID: {self.pool_id}, SLO Level: {self.slo_level}")
-        
-        # Construct base URL for this pool (multi-node aware)
+        # Construct base URL for this pool first (multi-node aware)
         self.base_url = self._construct_pool_base_url()
         logger.info(f"Pool base URL: {self.base_url}")
-    
+        
+        # Extract hostname from base_url for consistent pool_id generation
+        import urllib.parse
+        parsed_url = urllib.parse.urlparse(self.base_url)
+        hostname = parsed_url.hostname or "localhost"
+        
+        # Determine pool information from namespace using extracted hostname
+        self.pool_id, self.slo_level = determine_pool_info_from_hostname_and_namespace(hostname, self.namespace)
+        logger.info(f"Pool ID: {self.pool_id}, SLO Level: {self.slo_level}")
+
     def _construct_pool_base_url(self):
         """Construct the base URL for this pool, supporting multi-node deployments."""
         # Check if explicit pool URL is provided
@@ -278,6 +334,47 @@ class Frontend:
     @async_on_start
     async def register_with_global_scheduler_on_ready(self):
         """Register this pool with the Global Scheduler - REQUIRED for operation."""
+        
+        # CRITICAL: Wait for dependent services to be ready before registering
+        # This prevents the Global Scheduler from sending requests to unready pools
+        logger.info("Waiting for Processor to be ready before registering with Global Scheduler...")
+        
+        # Wait for Processor to be available and ready to handle requests
+        runtime = dynamo_context["runtime"]
+        namespace = dynamo_context["namespace"]
+        
+        # Get Processor client and wait for it to be responsive
+        processor_client = (
+            await runtime.namespace(namespace)
+            .component("Processor")
+            .endpoint("chat/completions")
+            .client()
+        )
+        
+        # Wait a bit more to ensure the full service chain is ready
+        import asyncio
+        await asyncio.sleep(5)
+        
+        # Test that the service chain is working with a simple health check
+        logger.info("Testing service readiness before Global Scheduler registration...")
+        try:
+            # Simple test request to verify the chain works
+            test_request = {
+                "model": self.frontend_config.served_model_name,
+                "messages": [{"role": "user", "content": "health check"}],
+                "max_tokens": 1
+            }
+            
+            # Try to send a test request (timeout quickly)
+            async with asyncio.timeout(30):
+                test_gen = await processor_client.chat_completions(test_request)
+                # Just get the first response to verify it works
+                await test_gen.__anext__()
+                logger.info("✅ Service chain is ready - proceeding with Global Scheduler registration")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Service readiness test failed, but proceeding with registration: {e}")
+        
         await register_with_global_scheduler(
             pool_id=self.pool_id,
             slo_level=self.slo_level,
