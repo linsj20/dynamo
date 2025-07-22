@@ -60,6 +60,10 @@ class GlobalScheduler:
         self.connection_pool_limit = int(os.getenv("GLOBAL_SCHEDULER_CONNECTION_LIMIT", "0"))
         self.connection_per_host_limit = int(os.getenv("GLOBAL_SCHEDULER_CONNECTION_PER_HOST_LIMIT", "0"))
         
+        # Communication with planners
+        self.pool_metrics: Dict[str, dict] = {}
+        self._communication_task = None
+        
         logger.info("Global Scheduler initialized")
 
     @async_on_start
@@ -98,6 +102,9 @@ class GlobalScheduler:
         )
         
         logger.info("Global Scheduler initialized - waiting for pool registrations...")
+        
+        # Start communication loop with planners
+        self._communication_task = asyncio.create_task(self._planner_communication_loop())
 
     @endpoint()
     async def register_pool(self, request: dict):
@@ -486,7 +493,7 @@ class GlobalScheduler:
             logger.error(f"ERROR: HTTP request to {url} failed: {e}")
             yield {
                 "success": False,
-                "error": f"HTTP request to pool {pool_config.pool_id} failed: {error_type}: {e}",
+                "error": f"HTTP request to pool {pool_config.pool_id}: {e}",
                 "assigned_pool": pool_config.pool_id
             }
     
@@ -573,9 +580,176 @@ class GlobalScheduler:
         logger.warning(f"No suitable pool found for SLO level: {slo_level.value}")
         return None
 
+    async def _planner_communication_loop(self):
+        """Periodically communicate with planners"""
+        logger.info("GLOBAL SCHEDULER COMMUNICATION: Starting communication loop")
+        while True:
+            await asyncio.sleep(20)  # Every 20 seconds
+            logger.info("GLOBAL SCHEDULER COMMUNICATION: Requesting metrics from planners")
+            await self._request_metrics_from_planners()
+            await asyncio.sleep(10)
+            logger.info("GLOBAL SCHEDULER COMMUNICATION: Sending instructions to planners")
+            await self._send_instructions_to_planners()
+
+    async def _request_metrics_from_planners(self):
+        """Request metrics from all registered planners"""
+        for pool_id, pool_config in self.pools.items():
+            try:
+                logger.info(f"GLOBAL SCHEDULER: Attempting to connect to planner in namespace {pool_config.namespace}")
+                planner_component = self.runtime.namespace(pool_config.namespace).component("Planner")
+                metrics_endpoint = planner_component.endpoint("get_planner_metrics")
+                client = await metrics_endpoint.client()
+                logger.info(f"GLOBAL SCHEDULER: Successfully connected to planner endpoint in {pool_config.namespace}")
+                
+                request_data = {"requester_id": "global_scheduler"}
+                response = await client.generate(request_data)
+                
+                async for response_item in response:
+                    # Handle Dynamo SDK Annotated response format
+                    data = response_item.data if hasattr(response_item, 'data') else response_item
+                    if data.get("success", False):
+                        metrics = data.get("metrics", {})
+                        logger.info("=" * 60)
+                        logger.info(f"GLOBAL SCHEDULER - RECEIVED METRICS FROM PLANNER: {pool_id}")
+                        logger.info(f"Metrics: {json.dumps(metrics, indent=2)}")
+                        logger.info("=" * 60)
+            except Exception as e:
+                logger.info(f"Could not request metrics from planner {pool_id}: {e}")
+
+    async def _send_instructions_to_planners(self):
+        """Send coordination instructions to planners"""
+        for pool_id, pool_config in self.pools.items():
+            try:
+                planner_component = self.runtime.namespace(pool_config.namespace).component("Planner")
+                instructions_endpoint = planner_component.endpoint("receive_coordination_instructions")
+                client = await instructions_endpoint.client()
+                logger.info(f"GLOBAL SCHEDULER: Successfully connected to instructions endpoint in {pool_config.namespace}")
+                
+                # Generate random instructions
+                instructions = {
+                    "scaling_suggestion": random.choice(["scale_up", "scale_down", "maintain"]),
+                    "priority_level": random.choice(["high", "medium", "low"]),
+                    "resource_limit": random.randint(1, 8),
+                    "load_balancing": random.choice(["enable", "disable"])
+                }
+                
+                request_data = {
+                    "sender_id": "global_scheduler",
+                    "instructions": instructions
+                }
+                response = await client.generate(request_data)
+                
+                async for response_item in response:
+                    # Handle Dynamo SDK Annotated response format
+                    data = response_item.data if hasattr(response_item, 'data') else response_item
+                    if data.get("success", False):
+                        logger.info("=" * 60)
+                        logger.info(f"GLOBAL SCHEDULER - SENT INSTRUCTIONS TO PLANNER: {pool_id}")
+                        logger.info(f"Instructions: {json.dumps(instructions, indent=2)}")
+                        logger.info("=" * 60)
+            except Exception as e:
+                logger.info(f"Could not send instructions to planner {pool_id}: {e}")
+
+    @endpoint()
+    async def receive_planner_metrics(self, request: dict):
+        """
+        Receive metrics from pool planners.
+        
+        Args:
+            request: Metrics data containing:
+                - planner_id: Unique identifier for the sending planner
+                - metrics: Dictionary of metrics data
+                
+        Yields:
+            Acknowledgment of received metrics
+        """
+        # Handle different request formats
+        if isinstance(request, str):
+            request_data = json.loads(request)
+        elif isinstance(request, dict):
+            request_data = request
+        else:
+            request_data = request
+        
+        # Extract required parameters
+        planner_id = request_data.get("planner_id")
+        metrics = request_data.get("metrics", {})
+        
+        # Validate required parameters
+        if not planner_id:
+            yield {"success": False, "error": "Missing required parameter: planner_id"}
+            return
+        
+        logger.info("=" * 60)
+        logger.info(f"RECEIVED METRICS FROM PLANNER: {planner_id}")
+        logger.info(f"Metrics: {json.dumps(metrics, indent=2)}")
+        logger.info("=" * 60)
+        
+        yield {
+            "success": True,
+            "status": "received", 
+            "planner_id": planner_id,
+            "metrics_count": len(metrics) if isinstance(metrics, dict) else 0
+        }
+
+    @endpoint()
+    async def send_coordination_data(self, request: dict):
+        """
+        Send coordination data to requesting planner.
+        
+        Args:
+            request: Coordination request containing:
+                - planner_id: Unique identifier for the requesting planner
+                
+        Yields:
+            Random coordination data for demonstration
+        """
+        # Handle different request formats
+        if isinstance(request, str):
+            request_data = json.loads(request)
+        elif isinstance(request, dict):
+            request_data = request
+        else:
+            request_data = request
+        
+        # Extract required parameters
+        planner_id = request_data.get("planner_id")
+        
+        # Validate required parameters
+        if not planner_id:
+            yield {"success": False, "error": "Missing required parameter: planner_id"}
+            return
+        
+        # Generate random coordination data
+        coordination_data = {
+            "global_load": random.uniform(0.3, 0.8),
+            "recommended_action": random.choice(["scale_up", "scale_down", "maintain"]),
+            "priority_boost": random.choice([True, False]),
+            "resource_allocation": random.randint(1, 8)
+        }
+        
+        logger.info("=" * 60)
+        logger.info(f"SENDING COORDINATION DATA TO PLANNER: {planner_id}")
+        logger.info(f"Data: {json.dumps(coordination_data, indent=2)}")
+        logger.info("=" * 60)
+        
+        yield {
+            "success": True,
+            "planner_id": planner_id, 
+            "coordination_data": coordination_data
+        }
+
     async def cleanup(self):
         """Cleanup resources when shutting down"""
         logger.info("Global Scheduler cleanup starting...")
+        
+        # Cancel communication task
+        if self._communication_task:
+            self._communication_task.cancel()
+            try:
+                await self._communication_task
+            except asyncio.CancelledError:
+                pass
         
         # Close HTTP session
         if self.http_session:

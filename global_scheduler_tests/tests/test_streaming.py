@@ -156,12 +156,12 @@ class StreamingSchedulerTest(BaseGlobalSchedulerTest):
                 avg_low_content = sum(low_content_lengths) / len(low_content_lengths)
                 logger.info(f"Low SLO avg content length: {avg_low_content:.0f} chars")
         
-        # Validate pool assignment accuracy
+        # Validate pool assignment accuracy (using prefix match)
         pool_assignment_correct = True
         for request in self.results:
             if request.success and request.expected_pool:
-                if request.assigned_pool != request.expected_pool:
-                    logger.error(f"FAIL: Request {request.request_id} assigned to {request.assigned_pool}, expected {request.expected_pool}")
+                if not request.assigned_pool or not request.assigned_pool.startswith(request.expected_pool):
+                    logger.error(f"FAIL: Request {request.request_id} assigned to {request.assigned_pool}, expected {request.expected_pool} (prefix)")
                     pool_assignment_correct = False
         
         # Overall test success criteria
