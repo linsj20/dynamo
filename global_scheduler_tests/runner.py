@@ -45,6 +45,7 @@ from tests.test_base import BaseGlobalSchedulerTest
 from tests.test_simple import SimpleSchedulerTest
 from tests.test_scaling import ScalingTest
 from tests.test_streaming import StreamingSchedulerTest
+from tests.test_genai_perf import GenAIPerfTest
 from monitor import SystemMonitor
 
 # Configure logging
@@ -259,12 +260,16 @@ class ServiceManager:
         logger.info(f"Starting Global Scheduler (log: {log_file})")
         
         try:
+            # Set up environment for Global Scheduler
+            env = os.environ.copy()
+            env['DYNAMO_PORT'] = '3999'  # Set HTTP server port for Global Scheduler
+            
             with open(log_file, 'w') as f:
                 process = subprocess.Popen([
                     'dynamo', 'serve', 
                     'dynamo.global_scheduler.scheduler:GlobalScheduler',
                     '--service-name', 'GlobalScheduler'
-                ], stdout=f, stderr=subprocess.STDOUT, env=os.environ)
+                ], stdout=f, stderr=subprocess.STDOUT, env=env)
                 
             self.processes['global_scheduler'] = process
             time.sleep(8)  # Give it time to start
@@ -658,6 +663,9 @@ class TestRunner:
                 elif self.test_type == "streaming":
                     test_instance = StreamingSchedulerTest(self.config)
                     result = await test_instance.run()
+                elif self.test_type == "genai-perf":
+                    test_instance = GenAIPerfTest(self.config)
+                    result = await test_instance.run()
                 else:
                     logger.error(f"Unknown test type: {self.test_type}")
                     result = False
@@ -728,7 +736,7 @@ class TestRunner:
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(description="Global Scheduler Test Runner with PD Disaggregated Architecture")
-    parser.add_argument("--test-type", choices=["simple", "scaling", "streaming"], default="simple",
+    parser.add_argument("--test-type", choices=["simple", "scaling", "streaming", "genai-perf"], default="simple",
                        help="Type of test to run (default: simple)")
     parser.add_argument("--deployment", choices=["local", "cluster", "custom"], default="local",
                        help="Deployment mode (default: local)")

@@ -4,7 +4,7 @@
 #SBATCH --account=coreai_comparch_sysarch
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
-#SBATCH --time=00:15:00
+#SBATCH --time=00:45:00
 #SBATCH --output=/home/shengjiel/project/dynamo/global_scheduler_tests/logs/slurm-test-%j-%t.out
 #SBATCH --error=/home/shengjiel/project/dynamo/global_scheduler_tests/logs/slurm-test-%j-%t.err
 #SBATCH --mail-type=BEGIN

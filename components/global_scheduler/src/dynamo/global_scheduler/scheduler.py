@@ -7,14 +7,16 @@ import logging
 import os
 import random
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Optional
 
 import aiohttp
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from dynamo.sdk import async_on_start, endpoint, service
+from dynamo.sdk import api, async_on_start, endpoint, service
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +498,193 @@ class GlobalScheduler:
                 "error": f"HTTP request to pool {pool_config.pool_id}: {e}",
                 "assigned_pool": pool_config.pool_id
             }
+
+    @endpoint()
+    @api(name="v1/chat/completions")
+    async def v1_chat_completions(self, request: dict):
+        """
+        OpenAI-compatible chat completions endpoint for GenAI-Perf integration.
+        
+        Accepts standard OpenAI chat completions requests and automatically assigns
+        SLO requirements based on configured strategy.
+        
+        Args:
+            request: OpenAI-format request with model, messages, etc.
+            
+        Returns:
+            OpenAI-compatible response (StreamingResponse for streaming, direct response for non-streaming)
+        """
+        try:
+            # Handle different request formats
+            if isinstance(request, dict):
+                request_data = request
+            elif hasattr(request, '__dict__'):
+                request_data = request.__dict__
+            elif hasattr(request, 'model_dump'):
+                request_data = request.model_dump()
+            else:
+                # Return OpenAI-style error in JSON format
+                error_response = {
+                    "error": {
+                        "message": f"Invalid request format: {type(request)}",
+                        "type": "invalid_request_error",
+                        "code": "invalid_request"
+                    }
+                }
+                logger.error(f"GLOBAL SCHEDULER ERROR: Invalid request format: {type(request)}")
+                return error_response
+
+            # Extract OpenAI request parameters
+            messages = request_data.get("messages", [])
+            if not messages:
+                error_response = {
+                    "error": {
+                        "message": "Missing required parameter: messages",
+                        "type": "invalid_request_error", 
+                        "code": "invalid_request"
+                    }
+                }
+                logger.error("GLOBAL SCHEDULER ERROR: Missing required parameter: messages")
+                return error_response
+
+            # Generate request ID and determine SLO requirement
+            request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            
+            # Get SLO requirement from request or use round-robin strategy
+            slo_requirement = request_data.get("slo_requirement")
+            if not slo_requirement:
+                # Use round-robin strategy as default
+                if not hasattr(self, '_request_counter'):
+                    self._request_counter = 0
+                slo_levels = ["high", "low"]  # Default SLO levels
+                slo_requirement = slo_levels[self._request_counter % len(slo_levels)]
+                self._request_counter += 1
+            
+            # Extract prompt from messages
+            prompt = ""
+            if messages and len(messages) > 0:
+                last_message = messages[-1]
+                if isinstance(last_message, dict) and "content" in last_message:
+                    prompt = last_message["content"]
+
+            logger.info(f"GLOBAL SCHEDULER: Processing v1/chat/completions request {request_id} with SLO {slo_requirement}")
+
+            # Find appropriate pool using SLO requirement
+            slo_level = SLOLevel(slo_requirement.lower())
+            pool_config = self._get_pool_for_slo(slo_level)
+            if not pool_config:
+                error_response = {
+                    "error": {
+                        "message": f"No pools available for SLO level: {slo_requirement}. No pools have registered yet.",
+                        "type": "server_error",
+                        "code": "no_pools_available"
+                    }
+                }
+                logger.error(f"GLOBAL SCHEDULER ERROR: No pools available for SLO level: {slo_requirement}")
+                return error_response
+
+            # Prepare the request payload for the pool's chat/completions endpoint
+            chat_request = {
+                "model": pool_config.model_name,  # Use registered model name
+                "messages": [
+                    {
+                        "role": "user", 
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": request_data.get("max_tokens", 100),
+                "temperature": request_data.get("temperature", 0.7),
+                "stream": request_data.get("stream", False)
+            }
+            
+            # Make HTTP request to pool's Frontend service
+            url = f"{pool_config.base_url}/v1/chat/completions"
+
+            # Handle streaming vs non-streaming
+            is_streaming = request_data.get("stream", False)
+            
+            if is_streaming:
+                # For streaming requests, return a StreamingResponse
+                async def stream_generator():
+                    try:
+                        async with self.http_session.post(url, json=chat_request) as response:
+                            if not response.status == 200:
+                                error_text = await response.text()
+                                logger.error(f"ERROR: Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}")
+                                error_response = {
+                                    "error": {
+                                        "message": f"Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}",
+                                        "type": "server_error",
+                                        "code": "pool_error"
+                                    }
+                                }
+                                yield f"data: {json.dumps(error_response)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+                            
+                            # Process Server-Sent Events stream and forward it
+                            async for line in response.content:
+                                if not line:
+                                    continue
+                                
+                                line_str = line.decode('utf-8').strip()
+                                if line_str:
+                                    yield f"{line_str}\n"
+                                    
+                    except Exception as e:
+                        logger.error(f"GLOBAL SCHEDULER ERROR in streaming: {str(e)}", exc_info=True)
+                        error_response = {
+                            "error": {
+                                "message": f"Internal server error: {str(e)}",
+                                "type": "server_error",
+                                "code": "internal_error"
+                            }
+                        }
+                        yield f"data: {json.dumps(error_response)}\n\n"
+                        yield "data: [DONE]\n\n"
+                
+                return StreamingResponse(stream_generator(), media_type="text/plain")
+            else:
+                # For non-streaming requests, make direct HTTP call
+                try:
+                    async with self.http_session.post(url, json=chat_request) as response:
+                        if not response.status == 200:
+                            error_text = await response.text()
+                            logger.error(f"ERROR: Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}")
+                            error_response = {
+                                "error": {
+                                    "message": f"Pool {pool_config.pool_id} returned HTTP {response.status}: {error_text}",
+                                    "type": "server_error",
+                                    "code": "pool_error"
+                                }
+                            }
+                            return error_response
+                        
+                        response_data = await response.json()
+                        logger.info(f"GLOBAL SCHEDULER: Successfully processed non-streaming request {request_id} from pool {pool_config.pool_id}")
+                        return response_data
+                        
+                except Exception as e:
+                    logger.error(f"GLOBAL SCHEDULER ERROR in non-streaming processing: {str(e)}", exc_info=True)
+                    error_response = {
+                        "error": {
+                            "message": f"Internal server error: {str(e)}",
+                            "type": "server_error",
+                            "code": "internal_error"
+                        }
+                    }
+                    return error_response
+        
+        except Exception as e:
+            logger.error(f"GLOBAL SCHEDULER CRITICAL ERROR in v1_chat_completions: {str(e)}", exc_info=True)
+            error_response = {
+                "error": {
+                    "message": f"Critical internal error: {str(e)}",
+                    "type": "server_error",
+                    "code": "critical_error"
+                }
+            }
+            return error_response
     
     @endpoint()
     async def get_pool_status(self, request: dict = None):
@@ -605,16 +794,34 @@ class GlobalScheduler:
                 response = await client.generate(request_data)
                 
                 async for response_item in response:
-                    # Handle Dynamo SDK Annotated response format
-                    data = response_item.data if hasattr(response_item, 'data') else response_item
-                    if data.get("success", False):
-                        metrics = data.get("metrics", {})
-                        logger.info("=" * 60)
-                        logger.info(f"GLOBAL SCHEDULER - RECEIVED METRICS FROM PLANNER: {pool_id}")
-                        logger.info(f"Metrics: {json.dumps(metrics, indent=2)}")
-                        logger.info("=" * 60)
+                    try:
+                        # Handle Dynamo SDK Annotated response format with proper type checking
+                        if hasattr(response_item, 'data'):
+                            data = response_item.data
+                        elif isinstance(response_item, dict):
+                            data = response_item
+                        else:
+                            logger.warning(f"GLOBAL SCHEDULER: Unexpected response type from planner {pool_id}: {type(response_item)}")
+                            continue
+                        
+                        # Ensure data is a dictionary before calling .get()
+                        if not isinstance(data, dict):
+                            logger.warning(f"GLOBAL SCHEDULER: Response data is not a dictionary for planner {pool_id}: {type(data)}")
+                            continue
+                            
+                        if data.get("success", False):
+                            metrics = data.get("metrics", {})
+                            logger.info("=" * 60)
+                            logger.info(f"GLOBAL SCHEDULER - RECEIVED METRICS FROM PLANNER: {pool_id}")
+                            logger.info(f"Metrics: {json.dumps(metrics, indent=2)}")
+                            logger.info("=" * 60)
+                        else:
+                            logger.warning(f"GLOBAL SCHEDULER: Planner {pool_id} returned unsuccessful response: {data}")
+                    except Exception as response_error:
+                        logger.error(f"GLOBAL SCHEDULER ERROR: Failed to process response from planner {pool_id}: {response_error}", exc_info=True)
+                        
             except Exception as e:
-                logger.info(f"Could not request metrics from planner {pool_id}: {e}")
+                logger.error(f"GLOBAL SCHEDULER ERROR: Could not request metrics from planner {pool_id}: {e}", exc_info=True)
 
     async def _send_instructions_to_planners(self):
         """Send coordination instructions to planners"""
@@ -640,15 +847,33 @@ class GlobalScheduler:
                 response = await client.generate(request_data)
                 
                 async for response_item in response:
-                    # Handle Dynamo SDK Annotated response format
-                    data = response_item.data if hasattr(response_item, 'data') else response_item
-                    if data.get("success", False):
-                        logger.info("=" * 60)
-                        logger.info(f"GLOBAL SCHEDULER - SENT INSTRUCTIONS TO PLANNER: {pool_id}")
-                        logger.info(f"Instructions: {json.dumps(instructions, indent=2)}")
-                        logger.info("=" * 60)
+                    try:
+                        # Handle Dynamo SDK Annotated response format with proper type checking
+                        if hasattr(response_item, 'data'):
+                            data = response_item.data
+                        elif isinstance(response_item, dict):
+                            data = response_item
+                        else:
+                            logger.warning(f"GLOBAL SCHEDULER: Unexpected response type from planner {pool_id}: {type(response_item)}")
+                            continue
+                        
+                        # Ensure data is a dictionary before calling .get()
+                        if not isinstance(data, dict):
+                            logger.warning(f"GLOBAL SCHEDULER: Response data is not a dictionary for planner {pool_id}: {type(data)}")
+                            continue
+                            
+                        if data.get("success", False):
+                            logger.info("=" * 60)
+                            logger.info(f"GLOBAL SCHEDULER - SENT INSTRUCTIONS TO PLANNER: {pool_id}")
+                            logger.info(f"Instructions: {json.dumps(instructions, indent=2)}")
+                            logger.info("=" * 60)
+                        else:
+                            logger.warning(f"GLOBAL SCHEDULER: Planner {pool_id} returned unsuccessful response: {data}")
+                    except Exception as response_error:
+                        logger.error(f"GLOBAL SCHEDULER ERROR: Failed to process response from planner {pool_id}: {response_error}", exc_info=True)
+                        
             except Exception as e:
-                logger.info(f"Could not send instructions to planner {pool_id}: {e}")
+                logger.error(f"GLOBAL SCHEDULER ERROR: Could not send instructions to planner {pool_id}: {e}", exc_info=True)
 
     @endpoint()
     async def receive_planner_metrics(self, request: dict):
