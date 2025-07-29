@@ -622,14 +622,39 @@ class GlobalScheduler:
                                 yield "data: [DONE]\n\n"
                                 return
                             
-                            # Process Server-Sent Events stream and forward it
-                            async for line in response.content:
-                                if not line:
+                            # Process Server-Sent Events stream line by line
+                            buffer = ""
+                            async for chunk in response.content.iter_chunked(8192):
+                                if not chunk:
                                     continue
+                                    
+                                # Decode chunk and add to buffer
+                                buffer += chunk.decode('utf-8')
                                 
-                                line_str = line.decode('utf-8').strip()
-                                if line_str:
-                                    yield f"{line_str}\n"
+                                # Process complete lines
+                                while '\n' in buffer:
+                                    line, buffer = buffer.split('\n', 1)
+                                    line = line.strip()
+                                    
+                                    if not line:
+                                        continue
+                                    
+                                    # Forward properly formatted SSE lines
+                                    if line.startswith('data: '):
+                                        yield f"{line}\n\n"
+                                    elif line == 'data: [DONE]':
+                                        yield f"{line}\n\n"
+                                    elif line.startswith('{') and line.endswith('}'):
+                                        # Raw JSON chunk - wrap in SSE format
+                                        yield f"data: {line}\n\n"
+                                    elif line == '[DONE]':
+                                        yield f"data: [DONE]\n\n"
+                                        
+                            # Process any remaining buffer content
+                            if buffer.strip():
+                                line = buffer.strip()
+                                if line.startswith('{') and line.endswith('}'):
+                                    yield f"data: {line}\n\n"
                                     
                     except Exception as e:
                         logger.error(f"GLOBAL SCHEDULER ERROR in streaming: {str(e)}", exc_info=True)
@@ -643,7 +668,7 @@ class GlobalScheduler:
                         yield f"data: {json.dumps(error_response)}\n\n"
                         yield "data: [DONE]\n\n"
                 
-                return StreamingResponse(stream_generator(), media_type="text/plain")
+                return StreamingResponse(stream_generator(), media_type="text/event-stream")
             else:
                 # For non-streaming requests, make direct HTTP call
                 try:
