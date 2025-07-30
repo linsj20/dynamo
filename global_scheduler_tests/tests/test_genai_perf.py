@@ -321,9 +321,21 @@ class GenAIPerfTest(BaseGlobalSchedulerTest):
                 logger.info(f"Goodput SLO constraints ({constraint_type}): {', '.join(goodput_constraints)}")
                 
             # Add SLO strategy through extra inputs
-            genai_perf_cmd.extend([
-                "--extra-inputs", f"slo_strategy:{slo_strategy}"
-            ])
+            if use_distributed_slos:
+                import json
+                # Write requirements to file to avoid command line length limits
+                slo_requirements_file = os.path.join(artifacts_dir, "distributed_slo_requirements_for_converter.json")
+                with open(slo_requirements_file, 'w') as f:
+                    json.dump(slo_requirements, f)
+                
+                genai_perf_cmd.extend([
+                    "--extra-inputs", "slo_strategy:threshold",
+                    "--extra-inputs", f"distributed_slo_requirements_file:{slo_requirements_file}"
+                ])
+            else:
+                genai_perf_cmd.extend([
+                    "--extra-inputs", f"slo_strategy:{slo_strategy}"
+                ])
             
             logger.info(f"GenAI-Perf command: {' '.join(genai_perf_cmd)}")
             logger.info(f"Parameters: {request_count} requests, {warmup_requests} warmup, "
