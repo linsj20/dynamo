@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 # Constants
 DYN_DISABLE_AUTO_GPU_ALLOCATION = "DYN_DISABLE_AUTO_GPU_ALLOCATION"
 DYN_DEPLOYMENT_ENV = "DYN_DEPLOYMENT_ENV"
-DYN_GPU_SCOPE = "DYN_GPU_SCOPE"  # New environment variable for GPU scope
 
 logger = logging.getLogger(__name__)
 
@@ -51,48 +50,14 @@ def format_memory_gb(memory_bytes: float) -> str:
     return f"{memory_bytes/1024/1024/1024:.1f}GB"
 
 
-def parse_gpu_scope(gpu_scope: str) -> list[int]:
-    """Parse GPU scope specification into a list of GPU indices.
-    
-    Args:
-        gpu_scope: GPU scope string (e.g., "0-3", "0,1,2,3", "4-7")
-        
-    Returns:
-        List of GPU indices
-        
-    Examples:
-        parse_gpu_scope("0-3") -> [0, 1, 2, 3]
-        parse_gpu_scope("4-7") -> [4, 5, 6, 7]
-        parse_gpu_scope("0,2,4") -> [0, 2, 4]
-    """
-    if not gpu_scope:
-        return []
-    
-    gpu_indices = []
-    for part in gpu_scope.split(','):
-        part = part.strip()
-        if '-' in part:
-            start, end = map(int, part.split('-'))
-            gpu_indices.extend(range(start, end + 1))
-        else:
-            gpu_indices.append(int(part))
-    
-    return gpu_indices
-
-
 class ResourceAllocator:
     def __init__(self) -> None:
         """Initialize the resource allocator."""
         self.system_resources = system_resources()
         self.gpu_manager = GPUManager()
-        
-        # GPU scope will be determined from environment or config, default to all GPUs
         self.available_gpu_indices = list(range(len(self.system_resources[NVIDIA_GPU])))
         self.remaining_gpus = len(self.system_resources[NVIDIA_GPU])
         self.gpu_scope = None
-        self._scope_initialized = False  # Track if scope has been set
-        
-        # For compatibility with the old implementation
         self._available_gpus: list[tuple[float, float]] = [
             (1.0, 1.0)  # each item is (remaining, unit)
             for _ in range(self.remaining_gpus)
@@ -103,33 +68,25 @@ class ResourceAllocator:
         )
     
     def _get_gpu_scope(self, service_config: dict = None) -> list[int]:
-        """Get GPU scope from service configuration or environment variable.
-        
-        Args:
-            service_config: Service configuration dictionary
+        """Get GPU scope from service configuration and parse it into GPU indices."""
+        if not service_config or "gpu-scope" not in service_config:
+            return []
             
-        Returns:
-            List of GPU indices that this allocator should use
-        """
-        # First check service configuration for gpu-scope
-        if service_config and "gpu-scope" in service_config:
-            gpu_scope_config = service_config["gpu-scope"]
-            logger.info(f"Using GPU scope from service config: {gpu_scope_config}")
-            try:
-                return parse_gpu_scope(gpu_scope_config)
-            except ValueError as e:
-                logger.warning(f"Failed to parse gpu-scope from config '{gpu_scope_config}': {e}")
+        gpu_scope_config = service_config["gpu-scope"]
+        logger.info(f"Using GPU scope from service config: {gpu_scope_config}")
         
-        # Fall back to DYN_GPU_SCOPE environment variable
-        gpu_scope_env = os.environ.get(DYN_GPU_SCOPE)
-        if gpu_scope_env:
-            logger.info(f"Using GPU scope from DYN_GPU_SCOPE: {gpu_scope_env}")
-            try:
-                return parse_gpu_scope(gpu_scope_env)
-            except ValueError as e:
-                logger.warning(f"Failed to parse DYN_GPU_SCOPE '{gpu_scope_env}': {e}")
+        if not gpu_scope_config:
+            return []
         
-        return []
+        gpu_indices = []
+        for part in gpu_scope_config.split(','):
+            part = part.strip()
+            if '-' in part:
+                start, end = map(int, part.split('-'))
+                gpu_indices.extend(range(start, end + 1))
+            else:
+                gpu_indices.append(int(part))
+        return gpu_indices
 
     def assign_gpus(self, count: float, service_name: str = "") -> list[int]:
         """
@@ -212,9 +169,9 @@ class ResourceAllocator:
         if assigned:
             if self.gpu_scope:
                 physical_gpus = [self.available_gpu_indices[i] for i in assigned]
-                logger.info(f"Allocated logical GPUs {assigned} (physical GPUs {physical_gpus}) from scope {self.available_gpu_indices}")
+                logger.debug(f"Allocated logical GPUs {assigned} (physical GPUs {physical_gpus}) from scope {self.available_gpu_indices}")
             else:
-                logger.info(f"Allocated GPUs {assigned}")
+                logger.debug(f"Allocated GPUs {assigned}")
         
         return assigned
 
@@ -243,55 +200,39 @@ class ResourceAllocator:
 
         config = services[service.name]
         
-        # Initialize GPU scope only once per allocator instance
-        if not self._scope_initialized:
-            # Check for GPU scope in Common configuration
-            common_config = services.get("Common", {})
-            gpu_scope = self._get_gpu_scope(common_config)
-            
-            # Update GPU scope for this service if specified
-            if gpu_scope:
-                self.gpu_scope = gpu_scope
-                self.available_gpu_indices = gpu_scope
-                # Reset allocations for new scope
-                self.remaining_gpus = len(gpu_scope)
-                self._available_gpus = [(1.0, 1.0) for _ in range(self.remaining_gpus)]
-                logger.info(f"ResourceAllocator using GPU scope: {gpu_scope}")
-            else:
-                # Use all available GPUs if no scope specified
-                self.gpu_scope = None
-                self.available_gpu_indices = list(range(len(self.system_resources[NVIDIA_GPU])))
-                self.remaining_gpus = len(self.system_resources[NVIDIA_GPU])
-                self._available_gpus = [(1.0, 1.0) for _ in range(self.remaining_gpus)]
-                logger.info(f"ResourceAllocator using all GPUs: {self.available_gpu_indices}")
-            
-            self._scope_initialized = True
-        elif self.gpu_scope:
-            logger.debug(f"Service {service.name} using already initialized GPU scope: {self.gpu_scope}")
+        # Check for GPU scope in Common configuration
+        common_config = services.get("Common", {})
+        gpu_scope = self._get_gpu_scope(common_config)
         
+        # Update GPU scope for this service if specified
+        if gpu_scope:
+            self.gpu_scope = gpu_scope
+            self.available_gpu_indices = gpu_scope
+            # Reset allocations for new scope
+            self.remaining_gpus = len(gpu_scope)
+            self._available_gpus = [(1.0, 1.0) for _ in range(self.remaining_gpus)]
+            logger.info(f"ResourceAllocator using GPU scope: {gpu_scope}")
+        else:
+            # Use all available GPUs if no scope specified
+            self.gpu_scope = None
+            self.available_gpu_indices = list(range(len(self.system_resources[NVIDIA_GPU])))
+            self.remaining_gpus = len(self.system_resources[NVIDIA_GPU])
+            self._available_gpus = [(1.0, 1.0) for _ in range(self.remaining_gpus)]
+            logger.info(f"ResourceAllocator using all GPUs: {self.available_gpu_indices}")
+            
         logger.debug(f"Using config for {service.name}: {config}")
 
         num_gpus = 0
         num_workers = 1
         resource_envs: list[dict[str, str]] = []
 
-        # Check for GPU requirements from service decorator first
-        service_resources = service.config.resources if hasattr(service, 'config') and service.config else None
-        if service_resources and hasattr(service_resources, 'gpu') and service_resources.gpu:
-            try:
-                num_gpus = int(service_resources.gpu)
-                logger.info(f"GPU requirement found in service decorator: {num_gpus}")
-            except (ValueError, AttributeError):
-                logger.warning(f"Invalid GPU value in service decorator: {service_resources.gpu}")
-        
-        # Check for runtime config override for GPU resources
+        # Check for GPU requirements from config
         if "gpu" in (config.get("resources") or {}):
             try:
-                runtime_gpus = int(config["resources"]["gpu"])
-                logger.info(f"GPU requirement override from runtime config: {runtime_gpus}")
-                num_gpus = runtime_gpus  # Runtime config takes precedence
+                num_gpus = int(config["resources"]["gpu"])
+                logger.info(f"GPU requirement from config: {num_gpus}")
             except (ValueError, TypeError):
-                logger.warning(f"Invalid GPU value in runtime config: {config['resources']['gpu']}")
+                logger.warning(f"Invalid GPU value in config: {config['resources']['gpu']}")
 
         # Check if we have enough GPUs
         if num_gpus > 0:
@@ -310,19 +251,13 @@ class ResourceAllocator:
                         f"Service may fail due to inadequate GPU resources."
                     )
 
-        # Determine number of workers - runtime config takes precedence
-        if "workers" in config:
+        # Determine number of workers
+        if config.get("workers"):
             num_workers = config["workers"]
-            logger.info(f"Using runtime configured worker count: {num_workers}")
-        elif service_resources and hasattr(service.config, 'workers'):
-            num_workers = service.config.workers
-            logger.info(f"Using service decorator worker count: {num_workers}")
+            logger.info(f"Using configured worker count: {num_workers}")
 
         # Handle GPU allocation
-        # Check if GPU allocation is disabled
-        disable_allocation = os.environ.get(DYN_DISABLE_AUTO_GPU_ALLOCATION, '').lower() in ('1', 'true', 'yes', 'on')
-        
-        if num_gpus > 0 and not disable_allocation:
+        if num_gpus and DYN_DISABLE_AUTO_GPU_ALLOCATION not in os.environ:
             logger.info("GPU allocation enabled")
 
             if os.environ.get(DYN_DEPLOYMENT_ENV):
@@ -334,12 +269,7 @@ class ResourceAllocator:
 
                 # Generate environment variables for each worker
                 for _ in range(num_workers):
-                    # Map logical indices to physical GPU indices if using GPU scope
-                    if self.gpu_scope and assigned:
-                        physical_gpus = [self.available_gpu_indices[i] for i in assigned]
-                        env_vars = {"CUDA_VISIBLE_DEVICES": ",".join(map(str, physical_gpus))}
-                    else:
-                        env_vars = {"CUDA_VISIBLE_DEVICES": ",".join(map(str, assigned))}
+                    env_vars = {"CUDA_VISIBLE_DEVICES": ",".join(map(str, assigned))}
                     resource_envs.append(env_vars)
             else:
                 logger.info(
@@ -353,12 +283,7 @@ class ResourceAllocator:
                     )
 
                     # Generate environment variables for this worker
-                    # Map logical indices to physical GPU indices if using GPU scope
-                    if self.gpu_scope and assigned:
-                        physical_gpus = [self.available_gpu_indices[i] for i in assigned]
-                        env_vars = {"CUDA_VISIBLE_DEVICES": ",".join(map(str, physical_gpus))}
-                    else:
-                        env_vars = {"CUDA_VISIBLE_DEVICES": ",".join(map(str, assigned))}
+                    env_vars = {"CUDA_VISIBLE_DEVICES": ",".join(map(str, assigned))}
 
                     # If we have comprehensive GPU stats, log them
                     try:

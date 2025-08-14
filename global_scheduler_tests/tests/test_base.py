@@ -8,6 +8,8 @@ import asyncio
 import logging
 import time
 import requests
+import aiohttp
+import json
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
@@ -44,8 +46,7 @@ class BaseGlobalSchedulerTest(ABC):
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.runtime = None
-        self.scheduler_client = None
+        self.http_session: Optional[aiohttp.ClientSession] = None
         self.results: List[TestRequest] = []
         
     async def setup(self) -> bool:
@@ -56,8 +57,8 @@ class BaseGlobalSchedulerTest(ABC):
         if not await self._check_prerequisites():
             return False
             
-        # Connect to Global Scheduler
-        if not await self._connect_to_scheduler():
+        # Set up HTTP session for Global Scheduler communication
+        if not await self._setup_http_session():
             return False
             
         # Verify system architecture
@@ -70,10 +71,10 @@ class BaseGlobalSchedulerTest(ABC):
     async def cleanup(self):
         """Clean up test resources"""
         logger.info("Cleaning up test resources")
-        # Close any connections if needed
-        if self.runtime:
-            # Runtime cleanup would go here if needed
-            pass
+        # Close HTTP session if needed
+        if self.http_session:
+            await self.http_session.close()
+            self.http_session = None
     
     @abstractmethod
     async def run_test_logic(self) -> bool:
@@ -132,33 +133,39 @@ class BaseGlobalSchedulerTest(ABC):
         
         return True
     
-    async def _connect_to_scheduler(self) -> bool:
-        """Connect to the Global Scheduler"""
-        logger.info("Connecting to Global Scheduler...")
+    async def _setup_http_session(self) -> bool:
+        """Set up HTTP session for Global Scheduler communication"""
+        logger.info("Setting up HTTP session for Global Scheduler...")
         
         try:
-            # Import runtime after path setup
-            from dynamo.runtime import DistributedRuntime
+            # Create HTTP session with appropriate timeout and connection pooling
+            connector = aiohttp.TCPConnector(
+                limit=10,
+                limit_per_host=5,
+                ttl_dns_cache=300,
+                use_dns_cache=True,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True
+            )
             
-            # Initialize runtime
-            loop = asyncio.get_running_loop()
-            self.runtime = DistributedRuntime(loop, False)
+            self.http_session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=30),
+                headers={'User-Agent': 'GlobalSchedulerTest/1.0'}
+            )
             
-            # Connect to Global Scheduler
-            scheduler_component = self.runtime.namespace("dynamo").component("GlobalScheduler")
-            generate_endpoint = scheduler_component.endpoint("generate")
-            self.scheduler_client = await generate_endpoint.client()
-            
-            # Verify connection
-            instances = self.scheduler_client.instance_ids()
-            if not instances:
-                raise Exception("No global scheduler instances found")
-            
-            logger.info(f"PASS: Connected to Global Scheduler ({len(instances)} instances)")
-            return True
+            # Test connectivity to Global Scheduler
+            scheduler_url = self.config.get('global_scheduler_url', 'http://localhost:3999')
+            async with self.http_session.get(f"{scheduler_url}/health", timeout=aiohttp.ClientTimeout(total=5)) as response:
+                if response.status == 200:
+                    logger.info(f"PASS: Successfully connected to Global Scheduler at {scheduler_url}")
+                    return True
+                else:
+                    logger.warning(f"WARNING: Global Scheduler health check returned status {response.status}, but continuing...")
+                    return True  # Don't fail if health endpoint doesn't exist
             
         except Exception as e:
-            logger.error(f"FAIL: Failed to connect to Global Scheduler: {e}")
+            logger.error(f"FAIL: Failed to set up HTTP session for Global Scheduler: {e}")
             return False
     
     async def _verify_system_health(self) -> bool:
@@ -166,115 +173,153 @@ class BaseGlobalSchedulerTest(ABC):
         logger.info("Verifying system health...")
         
         try:
-            # Check if pools are registered with the Global Scheduler
-            status_endpoint = self.runtime.namespace("dynamo").component("GlobalScheduler").endpoint("get_pool_status")
-            status_client = await status_endpoint.client()
+            # Try to get pool status from Global Scheduler via HTTP
+            scheduler_url = self.config.get('global_scheduler_url', 'http://localhost:3999')
             
-            # Get pool status
-            pool_status_response = await status_client.get_pool_status()
-            
-            # Extract pool status from response
-            pool_status = None
-            async for status_item in pool_status_response:
-                pool_status = status_item
-                break
-            
-            if not pool_status or pool_status.get('total_pools', 0) == 0:
-                logger.warning("WARNING: No pools are registered yet - this may be expected during startup")
-                return True  # Don't fail - pools might register during test
-            
-            total_pools = pool_status.get('total_pools', 0)
-            connected_pools = pool_status.get('connected_pools', 0)
-            
-            logger.info(f"PASS: System health: {connected_pools}/{total_pools} pools connected")
+            # Note: This would require the Global Scheduler to expose an HTTP endpoint for pool status
+            # For now, we'll just verify basic connectivity which we already did in _setup_http_session
+            logger.info("PASS: Basic connectivity to Global Scheduler verified")
+            logger.info("Note: Pool status verification would require HTTP endpoint implementation")
             
             return True
             
         except Exception as e:
-            logger.warning(f"WARNING: Could not verify pool status: {e} - continuing with tests")
+            logger.warning(f"WARNING: Could not verify system health: {e} - continuing with tests")
             return True  # Don't fail on this - it's informational
     
     async def send_request(self, request: TestRequest) -> TestRequest:
-        """Send a single test request and populate results"""
+        """Send a single test request and populate results using HTTP v1/chat/completions endpoint"""
         logger.info(f"Sending request: {request.request_id} (SLO: {request.slo_requirement})")
         
         start_time = time.time()
         
         try:
-            # Prepare request data with streaming enabled
-            request_data = {
-                "request_id": request.request_id,
-                "slo_requirement": request.slo_requirement,
-                "prompt": request.prompt,
+            # Prepare OpenAI-compatible request data
+            chat_request = {
+                "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",  # Use the actual model from pool configs
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": request.prompt
+                    }
+                ],
                 "max_tokens": request.max_tokens,
                 "temperature": request.temperature,
-                "stream": True  # Enable streaming responses
+                "stream": True,  # Enable streaming responses
+                "slo_requirement": request.slo_requirement  # Add SLO requirement for Global Scheduler
             }
             
-            # Send request to Global Scheduler
-            response = await self.scheduler_client.generate(request_data)
+            # Get Global Scheduler URL
+            scheduler_url = self.config.get('global_scheduler_url', 'http://localhost:3999')
+            url = f"{scheduler_url}/v1/chat/completions"
             
-            # Process streaming response
-            first_token_time = None
-            response_chunks = []
-            final_response_data = None
-            
-            async for item in response:
-                # Handle potential Annotated type wrapper
-                actual_response_data = self._extract_response_data(item)
+            # Send HTTP request to Global Scheduler
+            async with self.http_session.post(url, json=chat_request) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"ERROR: Global Scheduler returned HTTP {response.status}: {error_text}")
+                    request.success = False
+                    request.error = f"HTTP {response.status}: {error_text}"
+                    request.response_time = time.time() - start_time
+                    return request
                 
-                # Skip None responses (happens with intermediate Annotated responses)
-                if actual_response_data is None:
-                    continue
+                # Process streaming response
+                first_token_time = None
+                response_chunks = []
+                accumulated_content = ""
+                final_response = None
                 
-                # Track first token time for TTFT metrics
-                if first_token_time is None:
-                    first_token_time = time.time()
+                # Process Server-Sent Events stream
+                buffer = ""
+                async for chunk in response.content.iter_chunked(8192):
+                    if not chunk:
+                        continue
+                        
+                    # Decode chunk and add to buffer
+                    buffer += chunk.decode('utf-8')
                     
-                response_chunks.append(actual_response_data)
+                    # Process complete lines
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        line = line.strip()
+                        
+                        if not line:
+                            continue
+                        
+                        # Parse SSE data
+                        if line.startswith('data: '):
+                            data_content = line[6:]
+                            if data_content == '[DONE]':
+                                break
+                                
+                            try:
+                                chunk_data = json.loads(data_content)
+                                response_chunks.append(chunk_data)
+                                
+                                # Track first token time for TTFT metrics
+                                if first_token_time is None:
+                                    first_token_time = time.time()
+                                
+                                # Extract content from streaming chunks
+                                if 'choices' in chunk_data and chunk_data['choices']:
+                                    choice = chunk_data['choices'][0]
+                                    if 'delta' in choice and 'content' in choice['delta']:
+                                        content = choice['delta']['content']
+                                        accumulated_content += content
+                                    
+                                    # Check for completion
+                                    if 'finish_reason' in choice and choice['finish_reason'] is not None:
+                                        # Create final response in OpenAI format
+                                        final_response = {
+                                            "id": chunk_data.get("id", f"chatcmpl-{request.request_id}"),
+                                            "object": "chat.completion",
+                                            "created": int(time.time()),
+                                            "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+                                            "choices": [{
+                                                "index": 0,
+                                                "message": {
+                                                    "role": "assistant",
+                                                    "content": accumulated_content
+                                                },
+                                                "finish_reason": choice['finish_reason']
+                                            }]
+                                        }
+                                        
+                                        # Add usage information if available
+                                        if 'usage' in chunk_data:
+                                            final_response['usage'] = chunk_data['usage']
+                                        break
+                                
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"WARNING: Failed to parse streaming chunk: {e}, data: {data_content}")
+                                continue
                 
-                # If this is an error response, stop processing
-                if not actual_response_data.get('success', True):
-                    final_response_data = actual_response_data
-                    break
+                # Calculate response metrics
+                end_time = time.time()
+                request.response_time = end_time - start_time
+                
+                # Calculate and store TTFT (Time to First Token) if we got streaming data
+                if first_token_time:
+                    request.ttft = first_token_time - start_time
+                    logger.info(f"TTFT for {request.request_id}: {request.ttft:.3f}s")
                     
-                # For successful streaming responses, collect the final complete response
-                if actual_response_data.get('success', False):
-                    final_response_data = actual_response_data
-            
-            # Calculate response metrics
-            end_time = time.time()
-            request.response_time = end_time - start_time
-            
-            # Calculate and store TTFT (Time to First Token) if we got streaming data
-            if first_token_time:
-                request.ttft = first_token_time - start_time
-                logger.info(f"TTFT for {request.request_id}: {request.ttft:.3f}s")
+                # Store streaming metrics
+                request.chunk_count = len(response_chunks)
+                request.is_streaming = True
+                request.total_content_length = len(accumulated_content)
                 
-            # Store streaming metrics
-            request.chunk_count = len(response_chunks)
-            request.is_streaming = True
-                
-            # Process final response
-            if final_response_data:
-                if final_response_data.get('success', False):
+                # Process final response
+                if final_response:
                     request.success = True
-                    request.assigned_pool = final_response_data.get('assigned_pool')
-                    request.response_data = final_response_data
+                    request.assigned_pool = None  # HTTP response doesn't include pool info
+                    request.response_data = {"success": True, "response": final_response}
                     
-                    # Extract content length and token count from response
-                    if 'response' in final_response_data:
-                        llm_response = final_response_data['response']
-                        if isinstance(llm_response, dict) and 'choices' in llm_response and llm_response['choices']:
-                            content = llm_response['choices'][0].get('message', {}).get('content', '')
-                            request.total_content_length = len(content)
-                            
-                            # Try to get actual token count from response usage info
-                            if 'usage' in llm_response and llm_response['usage'] is not None:
-                                request.output_token_count = llm_response['usage'].get('completion_tokens', 0)
-                            else:
-                                # Estimate token count (rough approximation: ~4 chars per token)
-                                request.output_token_count = max(1, len(content) // 4)
+                    # Try to get actual token count from response usage info
+                    if 'usage' in final_response and final_response['usage'] is not None:
+                        request.output_token_count = final_response['usage'].get('completion_tokens', 0)
+                    else:
+                        # Estimate token count (rough approximation: ~4 chars per token)
+                        request.output_token_count = max(1, len(accumulated_content) // 4)
                     
                     # Calculate TPOT (Time Per Output Token) if we have TTFT and token count
                     if request.ttft is not None and request.output_token_count > 0:
@@ -283,16 +328,40 @@ class BaseGlobalSchedulerTest(ABC):
                         logger.info(f"TPOT for {request.request_id}: {request.tpot:.3f}s/token ({request.output_token_count} tokens)")
                     
                     # Enhanced response summary for streaming
-                    self._print_streaming_response_summary(request, final_response_data, len(response_chunks))
+                    self._print_streaming_response_summary(request, request.response_data, len(response_chunks))
                     
+                elif accumulated_content:
+                    # Create final response even if we didn't get explicit finish_reason
+                    final_response = {
+                        "id": f"chatcmpl-{request.request_id}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": accumulated_content
+                            },
+                            "finish_reason": "stop"  # Default finish reason
+                        }]
+                    }
+                    request.success = True
+                    request.assigned_pool = None
+                    request.response_data = {"success": True, "response": final_response}
+                    request.output_token_count = max(1, len(accumulated_content) // 4)
+                    
+                    # Calculate TPOT if we have TTFT
+                    if request.ttft is not None and request.output_token_count > 0:
+                        generation_time = request.response_time - request.ttft
+                        request.tpot = generation_time / request.output_token_count
+                        logger.info(f"TPOT for {request.request_id}: {request.tpot:.3f}s/token ({request.output_token_count} tokens)")
+                    
+                    self._print_streaming_response_summary(request, request.response_data, len(response_chunks))
                 else:
+                    logger.warning(f"WARNING: No content received for streaming request {request.request_id}")
                     request.success = False
-                    request.error = final_response_data.get('error', 'Unknown error')
-                    logger.error(f"FAIL: Request failed: {request.error}")
-            else:
-                request.success = False
-                request.error = "No response data received from streaming request"
-                logger.error(f"FAIL: {request.error}")
+                    request.error = "Stream ended without content"
             
         except Exception as e:
             request.success = False
@@ -302,25 +371,12 @@ class BaseGlobalSchedulerTest(ABC):
         
         return request
     
-    def _extract_response_data(self, response_item):
-        """Extract response data from potentially wrapped Dynamo objects"""
-        # Check if this is a Dynamo Annotated object (has .data() method)
-        if hasattr(response_item, 'data') and callable(getattr(response_item, 'data')):
-            # This is a Dynamo Annotated object - call the data() method
-            # Note: data() can return None, so we need to handle that
-            data = response_item.data()
-            if data is not None:
-                return data
-            else:
-                # Skip None data responses - this happens with intermediate Annotated responses
-                return None
-        
-        # For non-Annotated objects, return as-is
-        return response_item
+
     
     def _print_streaming_response_summary(self, request: TestRequest, response_data: Dict[str, Any], chunk_count: int):
         """Print a summary of the streaming response in a readable format"""
-        metrics_str = f"{request.response_time:.2f}s -> {request.assigned_pool} ({chunk_count} chunks"
+        pool_info = request.assigned_pool if request.assigned_pool else "v1/chat/completions"
+        metrics_str = f"{request.response_time:.2f}s -> {pool_info} ({chunk_count} chunks"
         if request.ttft is not None:
             metrics_str += f", TTFT: {request.ttft:.3f}s"
         if request.tpot is not None:

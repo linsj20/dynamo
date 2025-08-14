@@ -261,10 +261,7 @@ class LocalConnector(PlannerConnector):
 
         if blocking:
             required_endpoint_ids = pre_add_endpoint_ids + 1
-            max_retries = 30  # Wait up to 150 seconds (30 * 5 seconds)
-            retry_count = 0
-            
-            while retry_count < max_retries:
+            while True:
                 current_endpoint_ids = await self._count_instance_ids(component_name)
                 if current_endpoint_ids == required_endpoint_ids:
                     break
@@ -272,18 +269,6 @@ class LocalConnector(PlannerConnector):
                     f"Waiting for {component_name} to start. Current endpoint IDs: {current_endpoint_ids}, Required endpoint IDs: {required_endpoint_ids}"
                 )
                 await asyncio.sleep(5)
-                retry_count += 1
-                
-            if retry_count >= max_retries:
-                # Worker failed to start within timeout, clean up GPU allocation
-                logger.error(f"Worker {watcher_name} failed to start within timeout, cleaning up GPU allocation for GPUs {allocated_gpu_ids}")
-                if component_name in ["VllmWorker", "PrefillWorker"] and watcher_name in state["components"]:
-                    del state["components"][watcher_name]
-                    await self._save_state(state)
-                    
-                # Also try to remove the circus watcher
-                await self.circus.remove_watcher(name=watcher_name, blocking=False)
-                return False
 
         return success
 

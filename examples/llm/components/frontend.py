@@ -67,82 +67,28 @@ class FrontendConfig(BaseModel):
     port: int = 8080
 
 
-def determine_pool_info_from_port(port: int):
-    """Determine pool ID and SLO level from port number."""
-    # Map port to pool information (based on runner.py port assignments)
-    if port == 8000:
-        return "high_slo_pool", "high"
-    elif port == 8002:
-        return "low_slo_pool", "low"
-    elif port == 8001:
-        return "medium_slo_pool", "medium"
-    else:
-        # Default fallback based on port
-        return f"pool_{port}", "medium"
-
-
-def determine_pool_info_from_hostname_and_namespace(hostname: str, namespace: str):
-    """Determine pool ID and SLO level from hostname and namespace."""
-    logger.info(f"DEBUG: Using provided hostname: {hostname}")
-    
-    # Clean hostname to be safe for pool_id (remove dots, etc)
-    hostname_safe = hostname.replace(".", "_").replace("-", "_")
-    logger.info(f"DEBUG: Safe hostname: {hostname_safe}")
-    
-    # Map namespace to pool information with hostname-specific pool_id
+def determine_pool_info(namespace: str, hostname: str = None):
+    """Determine pool ID and SLO level from namespace, with optional hostname for multinode deployments."""
+    # Determine SLO level from namespace
     if "high" in namespace.lower():
-        pool_id = f"high_slo_pool_{hostname_safe}"
-        logger.info(f"DEBUG: Generated pool_id for high SLO: {pool_id}")
-        return pool_id, "high"
+        slo_level = "high"
     elif "low" in namespace.lower():
-        pool_id = f"low_slo_pool_{hostname_safe}"
-        logger.info(f"DEBUG: Generated pool_id for low SLO: {pool_id}")
-        return pool_id, "low"
+        slo_level = "low"
     elif "medium" in namespace.lower():
-        pool_id = f"medium_slo_pool_{hostname_safe}"
-        logger.info(f"DEBUG: Generated pool_id for medium SLO: {pool_id}")
-        return pool_id, "medium"
+        slo_level = "medium"
     else:
         raise RuntimeError(f"Invalid pool namespace: {namespace}")
-
-
-def determine_pool_info_from_namespace(namespace: str):
-    """Determine pool ID and SLO level from namespace."""
-    import socket
-    import os
     
-    # Get node name for unique pool_id
-    node_ip = os.environ.get("NODE_IP")
-    hostname_env = os.environ.get("HOSTNAME")
-    socket_hostname = socket.gethostname()
-    
-    # Debug logging for hostname resolution
-    logger.info(f"DEBUG: NODE_IP env var: {node_ip}")
-    logger.info(f"DEBUG: HOSTNAME env var: {hostname_env}")
-    logger.info(f"DEBUG: socket.gethostname(): {socket_hostname}")
-    
-    node_name = node_ip or hostname_env or socket_hostname
-    logger.info(f"DEBUG: Selected node_name: {node_name}")
-    
-    # Clean node name to be safe for pool_id (remove dots, etc)
-    node_name_safe = node_name.replace(".", "_").replace("-", "_")
-    logger.info(f"DEBUG: Safe node_name: {node_name_safe}")
-    
-    # Map namespace to pool information with node-specific pool_id
-    if "high" in namespace.lower():
-        pool_id = f"high_slo_pool_{node_name_safe}"
-        logger.info(f"DEBUG: Generated pool_id for high SLO: {pool_id}")
-        return pool_id, "high"
-    elif "low" in namespace.lower():
-        pool_id = f"low_slo_pool_{node_name_safe}"
-        logger.info(f"DEBUG: Generated pool_id for low SLO: {pool_id}")
-        return pool_id, "low"
-    elif "medium" in namespace.lower():
-        pool_id = f"medium_slo_pool_{node_name_safe}"
-        logger.info(f"DEBUG: Generated pool_id for medium SLO: {pool_id}")
-        return pool_id, "medium"
+    # For multinode deployments, include hostname in pool_id to ensure uniqueness
+    if hostname and hostname != "localhost":
+        # Clean hostname to be safe for pool_id (remove dots, etc)
+        hostname_safe = hostname.replace(".", "_").replace("-", "_")
+        pool_id = f"{slo_level}_slo_pool_{hostname_safe}"
     else:
-        raise RuntimeError(f"Invalid pool namespace: {namespace}")
+        # Single node or local deployment - use simple pool_id
+        pool_id = f"{slo_level}_slo_pool"
+    
+    return pool_id, slo_level
 
 
 async def register_with_global_scheduler(pool_id: str, slo_level: str, base_url: str, namespace: str, model_name: str):
@@ -161,27 +107,21 @@ async def register_with_global_scheduler(pool_id: str, slo_level: str, base_url:
     logger.info(f"Registering pool {pool_id} with Global Scheduler using Dynamo runtime")
     logger.info(f"Registration data: {registration_data}")
     
-    # Use Dynamo runtime to communicate with Global Scheduler
     scheduler_component = runtime.namespace("dynamo").component("GlobalScheduler")
     
-    # Create client for the register_pool endpoint
     register_endpoint = scheduler_component.endpoint("register_pool")
     register_client = await register_endpoint.client()
     
-    # Call generate method on the endpoint client and handle async response stream
     response_stream = await register_client.generate(registration_data)
     
-    # Read the response from the stream
     async for result in response_stream:
         logger.info(f"Registration result: {result}")
         
-        # Check if registration was successful
         if isinstance(result, dict) and not result.get("success", False):
             raise RuntimeError(f"Pool registration failed: {result.get('error', 'Unknown error')}")
         
         logger.info(f"Successfully registered pool {pool_id}")
         break  # Only expect one response for registration
-
 
 async def unregister_with_global_scheduler(pool_id: str):
     """Unregister this pool from the Global Scheduler using Dynamo runtime."""
@@ -191,17 +131,13 @@ async def unregister_with_global_scheduler(pool_id: str):
     
     logger.info(f"Unregistering pool {pool_id} from Global Scheduler using Dynamo runtime")
     
-    # Use Dynamo runtime to communicate with Global Scheduler  
     scheduler_component = runtime.namespace("dynamo").component("GlobalScheduler")
     
-    # Create client for the unregister_pool endpoint
     unregister_endpoint = scheduler_component.endpoint("unregister_pool")
     unregister_client = await unregister_endpoint.client()
     
-    # Call generate method on the endpoint client and handle async response stream
     response_stream = await unregister_client.generate(unregistration_data)
     
-    # Read the response from the stream
     async for result in response_stream:
         logger.info(f"Unregistration result: {result}")
         
@@ -232,66 +168,35 @@ class Frontend:
         self.process = None
         self.pool_id = None
         self.slo_level = None
-        
-        # Debug: Log ServiceConfig contents
-        config = ServiceConfig.get_instance()
-        service_config = config.get("Frontend", {})
-        service_args = service_config.get("ServiceArgs", {})
-        dynamo_config = service_args.get("dynamo", {})
-        
-        logger.info(f"Full Frontend config: {frontend_config.model_dump()}")
-        logger.info(f"ServiceArgs: {service_args}")
-        logger.info(f"Dynamo config: {dynamo_config}")
-        
         self.setup_model()
         self.start_http_server()
         
-        # Get namespace directly from dynamo_context as it contains the active namespace
         self.namespace = dynamo_context["namespace"]
-        logger.info(f"Final namespace: {self.namespace}")
-        
-        # Construct base URL for this pool first (multi-node aware)
         self.base_url = self._construct_pool_base_url()
-        logger.info(f"Pool base URL: {self.base_url}")
         
-        # Extract hostname from base_url for consistent pool_id generation
         import urllib.parse
         parsed_url = urllib.parse.urlparse(self.base_url)
         hostname = parsed_url.hostname or "localhost"
-        
-        # Determine pool information from namespace using extracted hostname
-        self.pool_id, self.slo_level = determine_pool_info_from_hostname_and_namespace(hostname, self.namespace)
-        logger.info(f"Pool ID: {self.pool_id}, SLO Level: {self.slo_level}")
+        self.pool_id, self.slo_level = determine_pool_info(self.namespace, hostname)
 
     def _construct_pool_base_url(self):
         """Construct the base URL for this pool, supporting multi-node deployments."""
-        # Check if explicit pool URL is provided
         pool_url = os.environ.get("POOL_BASE_URL")
         if pool_url:
             return pool_url
         
-        # Check for host/port environment variables
         pool_host = os.environ.get("POOL_HOST")
         if not pool_host:
-            # Try to get the node's external IP or hostname
             pool_host = os.environ.get("NODE_IP") or os.environ.get("HOSTNAME") or "localhost"
-        
         return f"http://{pool_host}:{self.frontend_config.port}"
 
     def setup_model(self):
         """Configure the model for HTTP service using llmctl."""
-        # Construct the correct endpoint based on the namespace we're running in
-        # Get namespace from dynamo_context which contains the active namespace
         namespace = dynamo_context.get("namespace")
         if namespace and namespace != "dynamo":
-            # We're in a pool namespace (e.g., high_slo, low_slo), use that namespace's processor
             endpoint = f"{namespace}.Processor.chat/completions"
         else:
-            # Fallback to the configured endpoint
             endpoint = self.frontend_config.endpoint
-        
-        logger.info(f"Using endpoint: {endpoint}")
-        logger.info(f"Using namespace: {namespace}")
         
         # Remove existing model registration (with namespace parameter)
         subprocess.run(
@@ -334,12 +239,8 @@ class Frontend:
     @async_on_start
     async def register_with_global_scheduler_on_ready(self):
         """Register this pool with the Global Scheduler - REQUIRED for operation."""
-        
-        # CRITICAL: Wait for dependent services to be ready before registering
-        # This prevents the Global Scheduler from sending requests to unready pools
         logger.info("Waiting for Processor to be ready before registering with Global Scheduler...")
         
-        # Wait for Processor to be available and ready to handle requests
         runtime = dynamo_context["runtime"]
         namespace = dynamo_context["namespace"]
         
@@ -351,29 +252,8 @@ class Frontend:
             .client()
         )
         
-        # Wait a bit more to ensure the full service chain is ready
-        import asyncio
+        # Wait for Global Scheduler to be ready
         await asyncio.sleep(5)
-        
-        # Test that the service chain is working with a simple health check
-        logger.info("Testing service readiness before Global Scheduler registration...")
-        try:
-            # Simple test request to verify the chain works
-            test_request = {
-                "model": self.frontend_config.served_model_name,
-                "messages": [{"role": "user", "content": "health check"}],
-                "max_tokens": 1
-            }
-            
-            # Try to send a test request (timeout quickly)
-            async with asyncio.timeout(30):
-                test_gen = await processor_client.chat_completions(test_request)
-                # Just get the first response to verify it works
-                await test_gen.__anext__()
-                logger.info("✅ Service chain is ready - proceeding with Global Scheduler registration")
-                
-        except Exception as e:
-            logger.warning(f"⚠️ Service readiness test failed, but proceeding with registration: {e}")
         
         await register_with_global_scheduler(
             pool_id=self.pool_id,
@@ -398,14 +278,10 @@ class Frontend:
     @on_shutdown
     def cleanup(self):
         """Clean up resources before shutdown."""
-        # Unregister from Global Scheduler
         if self.pool_id:
             asyncio.run(unregister_with_global_scheduler(self.pool_id))
 
-        # Get namespace for proper cleanup
         namespace = dynamo_context.get("namespace")
-        
-        # circusd manages shutdown of http server process, we just need to remove the model using the on_shutdown hook
         subprocess.run(
             [
                 "llmctl",

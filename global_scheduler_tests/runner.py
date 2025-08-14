@@ -166,7 +166,12 @@ class ServiceManager:
         
         # Start etcd
         try:
-            log_file = os.path.join(self.logs_dir, 'etcd.log')
+            if self.multinode:
+                import socket
+                hostname = socket.gethostname()
+                log_file = os.path.join(self.logs_dir, f'etcd_{hostname}.log')
+            else:
+                log_file = os.path.join(self.logs_dir, 'etcd.log')
             logger.info(f"  Starting etcd (log: {log_file})")
             with open(log_file, 'w') as f:
                 # Configure etcd to listen on all interfaces for multinode, localhost for single node
@@ -184,7 +189,11 @@ class ServiceManager:
             time.sleep(3)
             
             # Check health
-            health_check = subprocess.run(['curl', '-f', 'http://localhost:2379/health'], 
+            if self.multinode:
+                health_url = f'http://{self.head_node_ip}:2379/health'
+            else:
+                health_url = 'http://localhost:2379/health'
+            health_check = subprocess.run(['curl', '-f', health_url], 
                                         capture_output=True, timeout=5)
             if health_check.returncode != 0:
                 logger.error(f"FAIL: etcd health check failed - check {log_file}")
@@ -228,7 +237,12 @@ class ServiceManager:
         
         # Start NATS
         try:
-            log_file = os.path.join(self.logs_dir, 'nats.log')
+            if self.multinode:
+                import socket
+                hostname = socket.gethostname()
+                log_file = os.path.join(self.logs_dir, f'nats_{hostname}.log')
+            else:
+                log_file = os.path.join(self.logs_dir, 'nats.log')
             logger.info(f"  Starting NATS (log: {log_file})")
             with open(log_file, 'w') as f:
                 # Configure NATS to listen on all interfaces for multinode, default for single node
@@ -242,7 +256,11 @@ class ServiceManager:
             time.sleep(3)
             
             # Check health
-            health_check = subprocess.run(['curl', '-f', 'http://localhost:8222/varz'], 
+            if self.multinode:
+                health_url = f'http://{self.head_node_ip}:8222/varz'
+            else:
+                health_url = 'http://localhost:8222/varz'
+            health_check = subprocess.run(['curl', '-f', health_url], 
                                         capture_output=True, timeout=5)
             if health_check.returncode != 0:
                 logger.error(f"FAIL: NATS health check failed - check {log_file}")
@@ -256,7 +274,12 @@ class ServiceManager:
         
     def _start_global_scheduler(self) -> bool:
         """Start the Global Scheduler service"""
-        log_file = os.path.join(self.logs_dir, 'global_scheduler.log')
+        if self.multinode:
+            import socket
+            hostname = socket.gethostname()
+            log_file = os.path.join(self.logs_dir, f'global_scheduler_{hostname}.log')
+        else:
+            log_file = os.path.join(self.logs_dir, 'global_scheduler.log')
         logger.info(f"Starting Global Scheduler (log: {log_file})")
         
         try:
@@ -598,9 +621,9 @@ class TestRunner:
                 if not self.service_manager.start_all_services():
                     logger.error("Failed to start services")
                     logger.error("Check the following log files for details:")
-                    logger.error(f"  - {self.service_manager.logs_dir}/etcd.log")
-                    logger.error(f"  - {self.service_manager.logs_dir}/nats.log")
-                    logger.error(f"  - {self.service_manager.logs_dir}/global_scheduler.log")
+                    logger.error(f"  - {self.service_manager.logs_dir}/etcd_*.log")
+                    logger.error(f"  - {self.service_manager.logs_dir}/nats_*.log")
+                    logger.error(f"  - {self.service_manager.logs_dir}/global_scheduler_*.log")
                     logger.error(f"  - {self.service_manager.logs_dir}/*_slo_pool*.log (pool logs)")
                     return False
                 

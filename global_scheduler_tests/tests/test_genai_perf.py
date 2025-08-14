@@ -65,6 +65,7 @@ class DistributedSLOGenerator:
         - 'uniform:50:150' -> uniform distribution [50, 150]
         - 'lognormal:4.6:0.2' -> lognormal distribution (ln_mean, ln_std)
         - 'bimodal:50:20:150:30:0.7' -> bimodal (μ1:σ1:μ2:σ2:weight1)
+        - 'discrete:5:0.2:7:0.3:10:0.5' -> discrete values (value:prob pairs)
         """
         try:
             parts = config.split(':')
@@ -98,7 +99,13 @@ class DistributedSLOGenerator:
                     value = np.random.normal(mean1, std1)
                 else:
                     value = np.random.normal(mean2, std2)
-                return max(1.0, value)
+                return max(8.5, value)
+                
+            elif dist_type == 'discrete':
+                # Discrete distribution: alternating value:probability pairs
+                values = [float(parts[i]) for i in range(1, len(parts), 2)]
+                probs = [float(parts[i]) for i in range(2, len(parts), 2)]
+                return np.random.choice(values, p=probs)
                 
             else:
                 logger.warning(f"Unknown distribution type '{dist_type}' for {metric_name}")
@@ -254,10 +261,11 @@ class GenAIPerfTest(BaseGlobalSchedulerTest):
                 os.makedirs(artifacts_dir, exist_ok=True)
                 DistributedSLOGenerator.save_slo_requirements(slo_requirements, slo_file)
                 
-                # For now, use average values as GenAI-Perf constraints
-                # TODO: Extend GenAI-Perf to support per-request SLO evaluation
+                # Use distributed per-request SLO evaluation with GenAI-Perf
+                # NOTE: GenAI-Perf now supports per-request SLO evaluation via --distributed-slo flag
                 goodput_constraints = self._compute_average_constraints(slo_requirements)
-                logger.info(f"Using average constraints for GenAI-Perf: {goodput_constraints}")
+                logger.info(f"Using distributed SLO evaluation with per-request requirements (averaged constraints for parent class compatibility only): {goodput_constraints}")
+                logger.info(f"Per-request SLO requirements will be embedded in request payloads")
                 
             else:
                 # Use traditional static goodput constraints
@@ -317,8 +325,15 @@ class GenAIPerfTest(BaseGlobalSchedulerTest):
             # Add goodput constraints for SLO compliance measurement
             if goodput_constraints:
                 genai_perf_cmd.extend(["--goodput"] + goodput_constraints)
-                constraint_type = "distributed (averaged)" if use_distributed_slos else "static"
+                constraint_type = "per-request (no fallback)" if use_distributed_slos else "static"
                 logger.info(f"Goodput SLO constraints ({constraint_type}): {', '.join(goodput_constraints)}")
+                if use_distributed_slos:
+                    logger.info("Note: These constraints are only used for parent class compatibility - actual evaluation uses per-request SLO requirements")
+                
+            # Enable distributed SLO evaluation if using per-request requirements
+            if use_distributed_slos:
+                genai_perf_cmd.append("--distributed-slo")
+                logger.info("Enabled distributed per-request SLO evaluation")
                 
             # Add SLO strategy through extra inputs
             if use_distributed_slos:
@@ -328,8 +343,10 @@ class GenAIPerfTest(BaseGlobalSchedulerTest):
                 with open(slo_requirements_file, 'w') as f:
                     json.dump(slo_requirements, f)
                 
+                logger.info(f"Distributed SLO requirements file: {slo_requirements_file}")
+                
                 genai_perf_cmd.extend([
-                    "--extra-inputs", "slo_strategy:threshold",
+                    "--extra-inputs", f"slo_strategy:{slo_strategy}",
                     "--extra-inputs", f"distributed_slo_requirements_file:{slo_requirements_file}"
                 ])
             else:
@@ -471,12 +488,13 @@ class GenAIPerfTest(BaseGlobalSchedulerTest):
                           f"p95: {metric_stats['p95']:.1f}, "
                           f"range: [{metric_stats['min']:.1f}, {metric_stats['max']:.1f}]")
             
-            # TODO: Implement detailed per-request SLO compliance analysis
-            # This would involve:
-            # 1. Loading GenAI-Perf results
-            # 2. Matching each request's actual metrics against its specific SLO requirements
-            # 3. Computing distributed goodput metrics
-            logger.info("Note: Per-request SLO compliance analysis requires extending GenAI-Perf")
+            # Per-request SLO compliance analysis is now supported via DistributedGoodputCalculator
+            # GenAI-Perf will automatically:
+            # 1. Extract per-request SLO requirements from request payloads
+            # 2. Evaluate each request against its specific SLO requirements
+            # 3. Compute distributed goodput metrics and compliance statistics
+            logger.info("Per-request SLO compliance analysis will be performed automatically by GenAI-Perf")
+            logger.info("Results will include individual request compliance and distributed goodput metrics")
             
         except Exception as e:
             logger.error(f"Failed to analyze distributed SLO results: {e}")

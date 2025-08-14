@@ -82,7 +82,9 @@ class ServiceManager:
         logger.info("Starting Global Scheduler...")
         
         try:
-            log_file = os.path.join(self.logs_dir, 'global_scheduler.log')
+            import socket
+            hostname = socket.gethostname()
+            log_file = os.path.join(self.logs_dir, f'global_scheduler_{hostname}.log')
             with open(log_file, 'w') as f:
                 process = subprocess.Popen([
                     'dynamo', 'serve', 
@@ -126,7 +128,9 @@ class ServiceManager:
     def _start_etcd(self) -> bool:
         """Start etcd service"""
         try:
-            log_file = os.path.join(self.logs_dir, 'etcd.log')
+            import socket
+            hostname = socket.gethostname()
+            log_file = os.path.join(self.logs_dir, f'etcd_{hostname}.log')
             with open(log_file, 'w') as f:
                 # Configure etcd to listen on all interfaces for multinode, localhost for single node
                 if self.multinode and self.head_node_ip:
@@ -145,7 +149,11 @@ class ServiceManager:
             
             # Wait and check health
             time.sleep(3)
-            health_check = subprocess.run(['curl', '-f', 'http://localhost:2379/health'], 
+            if self.multinode and self.head_node_ip:
+                health_url = f'http://{self.head_node_ip}:2379/health'
+            else:
+                health_url = 'http://localhost:2379/health'
+            health_check = subprocess.run(['curl', '-f', health_url], 
                                         capture_output=True, timeout=5)
             if health_check.returncode == 0:
                 logger.info("PASS: etcd is healthy")
@@ -161,7 +169,9 @@ class ServiceManager:
     def _start_nats(self) -> bool:
         """Start NATS service"""
         try:
-            log_file = os.path.join(self.logs_dir, 'nats.log')
+            import socket
+            hostname = socket.gethostname()
+            log_file = os.path.join(self.logs_dir, f'nats_{hostname}.log')
             with open(log_file, 'w') as f:
                 # Configure NATS to listen on all interfaces for multinode, default for single node
                 if self.multinode and self.head_node_ip:
@@ -184,13 +194,21 @@ class ServiceManager:
                 return False
             
             # Check if NATS is healthy
-            health_check = subprocess.run(['curl', '-f', 'http://localhost:8222/varz'], 
+            if self.multinode and self.head_node_ip:
+                health_url = f'http://{self.head_node_ip}:8222/varz'
+            else:
+                health_url = 'http://localhost:8222/varz'
+            health_check = subprocess.run(['curl', '-f', health_url], 
                                         capture_output=True, timeout=5)
             if health_check.returncode == 0:
                 logger.info("PASS: NATS is healthy")
                 
                 # Check if JetStream is enabled
-                js_check = subprocess.run(['curl', '-s', 'http://localhost:8222/jsz'], 
+                if self.multinode and self.head_node_ip:
+                    js_url = f'http://{self.head_node_ip}:8222/jsz'
+                else:
+                    js_url = 'http://localhost:8222/jsz'
+                js_check = subprocess.run(['curl', '-s', js_url], 
                                         capture_output=True, timeout=5)
                 if js_check.returncode == 0 and b'"enabled":true' in js_check.stdout:
                     logger.info("PASS: JetStream is enabled")

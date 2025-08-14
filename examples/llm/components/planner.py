@@ -240,7 +240,6 @@ class Planner:
         # Note: all adjustments are blocking. Non-blocking adjustment and metric pulling
         # make the optimization problem too complex and should not be needed in most cases.
         logger.info(f"Making adjustments at t={time.time() - self.init_time:.1f}s")
-        return
 
         # check if decode/prefill workers is still the same
         # note that we only check length as endpoint ids might change
@@ -262,11 +261,9 @@ class Planner:
             self.p_endpoints
         )
         avg_kv_load = np.mean(self.kv_load)
-        # first check if we need to scale down any workers
-        # Use very conservative threshold ONLY when scaling down the last worker to 0
-        SCALE_TO_ZERO_CONSERVATIVE_THRESHOLD = -0.01  # Very low threshold for scaling to 0 workers
+        # Currently don't scale down workers to 0
+        SCALE_TO_ZERO_CONSERVATIVE_THRESHOLD = -0.01
         
-        # Determine prefill scale down threshold - be conservative only when scaling to 0
         prefill_scale_down_threshold = self.args.prefill_queue_scale_down_threshold
         is_scaling_prefill_to_zero = (len(self.p_endpoints) == 1 and self.args.min_endpoint == 0)
         
@@ -287,7 +284,7 @@ class Planner:
             else:
                 logger.info("Failed to scale down prefill worker")
         
-        # Determine decode scale down threshold - be conservative only when scaling to 0
+        # Currently don't scale down workers to 0
         decode_scale_down_threshold = self.args.decode_kv_scale_down_threshold
         is_scaling_decode_to_zero = (len(self.d_endpoints) == 1 and self.args.min_endpoint == 0)
         
@@ -410,8 +407,6 @@ class Planner:
         else:
             logger.error("Failed to start decode worker")
         
-        # Log current state - workers may not be registered yet, that's expected
-        logger.info("Both workers started with proper initialization order, they will register as they become ready")
         logger.info("Note: Workers are loading models and will register asynchronously")
 
     async def run(self):
@@ -424,7 +419,6 @@ class Planner:
                 "Running in no-operation mode - detailed metrics will be logged at DEBUG level"
             )
 
-        # Launch initial workers
         logger.info("Launching initial workers...")
         await self.ensure_minimum_workers()
 
@@ -460,27 +454,22 @@ class Planner:
 async def start_planner(runtime: DistributedRuntime, args: argparse.Namespace):
     planner = Planner(runtime, args)
     
-    # Fixed: Search for components under the correct instances/ prefix
     instances_prefix = f"instances/{args.namespace}"
     components = await runtime.etcd_client().kv_get_prefix(instances_prefix)
     
-    # Only show component table if there are actually components found (reduces noise)
-    if components:
-        console = Console()
-        table = Table()
-        table.add_column("Component", style="cyan")
-        table.add_column("Endpoint", style="green")
-        
-        for component in components:
-            data = json.loads(component["value"].decode("utf-8"))
-            if "component" in data:
-                name = data["component"]
-                endpoint = data["endpoint"]
-                table.add_row(name, endpoint)
-        
-        console.print(table)
-    else:
-        logger.debug(f"No components found in namespace: {args.namespace}")
+    console = Console()
+    table = Table()
+    table.add_column("Component", style="cyan")
+    table.add_column("Endpoint", style="green")
+    
+    for component in components:
+        data = json.loads(component["value"].decode("utf-8"))
+        if "component" in data:
+            name = data["component"]
+            endpoint = data["endpoint"]
+            table.add_row(name, endpoint)
+    
+    console.print(table)
 
     await planner.run()
 

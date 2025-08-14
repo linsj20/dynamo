@@ -422,9 +422,6 @@ def serve_dynamo_graph(
                 for watcher in watchers
             }
 
-            # CRITICAL FIX: Add all services from the configuration to the state file, even if they have 0 workers
-            # This ensures the planner can find base configurations for services it wants to scale
-            
             # Get all services from configuration, not just graph dependencies
             from dynamo.sdk.lib.config import ServiceConfig
             config = ServiceConfig.get_instance()
